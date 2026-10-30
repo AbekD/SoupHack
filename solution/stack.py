@@ -120,7 +120,8 @@ def _layer_spec(layer, cfg, inv_freq):
     return spec, (aq, bq, av, bv)
 
 
-def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False):
+def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False,
+                  attn_recompute=False):
     """Final-norm hidden states [N, D] fp16 of the real tokens, and the PackInfo."""
     cfg = qwen2_model.config
     if attention_mask is None:
@@ -137,6 +138,7 @@ def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False):
     eps = cfg.rms_norm_eps
     for layer in qwen2_model.layers:
         spec, (aq, bq, av, bv) = _layer_spec(layer, cfg, inv_freq)
+        spec["recompute"] = attn_recompute
         if not qwen2_model.training:
             spec["p"] = 0.0
         h, y = AddRMSNorm.apply(h, delta, layer.input_layernorm.weight, eps)

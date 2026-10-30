@@ -259,22 +259,50 @@ def dense_qkv(q_w, k_w, v_w):
     return buf
 
 
+def _attention_core(x, a, b_q, b_v, w_qkv, spec, pack):
+    """qkv GEMM (+bias), LoRA B, RoPE + scatter to [B, H, T, HD], SDPA. Returns the small autograd
+    graph (q, k_rep, v_rep, o_pad) that the backward differentiates."""
+    N = x.shape[0]
+    HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
+    B, T = pack.B, pack.T
+    dev = x.device
+    r = a.shape[1] // 2
+    qkv = torch.addmm(spec["bias16"], x, w_qkv.t()) if spec["bias16"] is not None \
+        else torch.mm(x, w_qkv.t())
+    lq = torch.mm(a[:, :r], b_q.to(torch.float16).t())   # [N, QD]
+    lv = torch.mm(a[:, r:], b_v.to(torch.float16).t())   # [N, KD]
+    q = torch.zeros(B, HQ, T, HD, device=dev, dtype=torch.float16)
+    k = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
+    v = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
+    if N:
+        rope_pack_kernel[(N,)](qkv, lq, lv, pack.pos, pack.dst, spec["inv_freq"],
+                               q, k, v, T, spec["scaling"], HQ=HQ, HK=HK, HD=HD, HAS_LORA=True,
+                               num_warps=2)
+    del qkv, lq, lv
+    group = HQ // HK
+    q.requires_grad_(True)
+    k_rep = k.repeat_interleave(group, dim=1).requires_grad_(True)
+    v_rep = v.repeat_interleave(group, dim=1).requires_grad_(True)
+    del k, v
+    with torch.enable_grad():
+        o_pad = torch.nn.functional.scaled_dot_product_attention(
+            q, k_rep, v_rep, is_causal=True, scale=spec["softmax_scale"])
+    return q, k_rep, v_rep, o_pad
+
+
 class AttentionBlock(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, a_q, b_q, a_v, b_v, spec, pack):
         # x [N, D] fp16 packed tokens. a_* [r, D], b_* [out, r] fp32 LoRA weights (trainable).
-        # spec: dict with weights / sizes / dropout; pack: PackInfo
+        # spec: dict with weights / sizes / dropout / recompute; pack: PackInfo
         N, D = x.shape
-        HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
-        QD, KD = HQ * HD, HK * HD
-        B, T = pack.B, pack.T
+        HQ, HD = spec["hq"], spec["hd"]
+        QD = HQ * HD
+        T = pack.T
         dev = x.device
-        p, scale = spec["p"], spec["scaling"]
+        p = spec["p"]
+        recompute = spec.get("recompute", False)
         with torch.autocast(device_type=dev.type, enabled=False):
-            w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
-            qkv = torch.addmm(spec["bias16"], x, w_qkv.t()) if spec["bias16"] is not None \
-                else torch.mm(x, w_qkv.t())
-            del w_qkv
             r = a_q.shape[0]
             a = torch.empty(N, 2 * r, device=dev, dtype=torch.float16)
             rng = None
@@ -288,33 +316,20 @@ class AttentionBlock(torch.autograd.Function):
             torch.mm(xq, a_q.to(torch.float16).t(), out=a[:, :r])
             torch.mm(xv, a_v.to(torch.float16).t(), out=a[:, r:])
             del xq, xv
-            lq = torch.mm(a[:, :r], b_q.to(torch.float16).t())   # [N, QD]
-            lv = torch.mm(a[:, r:], b_v.to(torch.float16).t())   # [N, KD]
-            q = torch.zeros(B, HQ, T, HD, device=dev, dtype=torch.float16)
-            k = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
-            v = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
-            if N:
-                rope_pack_kernel[(N,)](qkv, lq, lv, pack.pos, pack.dst, spec["inv_freq"],
-                                       q, k, v, T, scale, HQ=HQ, HK=HK, HD=HD, HAS_LORA=True,
-                                       num_warps=2)
-            del qkv, lq, lv
-            group = HQ // HK
-            q.requires_grad_(True)
-            k_rep = k.repeat_interleave(group, dim=1).requires_grad_(True)
-            v_rep = v.repeat_interleave(group, dim=1).requires_grad_(True)
-            del k, v
-            with torch.enable_grad():
-                o_pad = torch.nn.functional.scaled_dot_product_attention(
-                    q, k_rep, v_rep, is_causal=True, scale=spec["softmax_scale"])
+            w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
+            graph = _attention_core(x, a, b_q, b_v, w_qkv, spec, pack)
+            del w_qkv
+            o_pad = graph[3]
             o = torch.empty(N, QD, device=dev, dtype=torch.float16)
             if N:
-                gather_rows_kernel[(N, HQ)](o_pad.detach().contiguous(), pack.dst, o, T, H=HQ, HD=HD,
-                                            num_warps=1)
+                gather_rows_kernel[(N, HQ)](o_pad.detach().contiguous(), pack.dst, o, T, H=HQ,
+                                            HD=HD, num_warps=1)
             w_o = unpack_nf4(spec["o_w"])
             out = torch.mm(o, w_o.t())
             del w_o, o
         ctx.spec, ctx.pack, ctx.rng = spec, pack, rng
-        ctx.graph = (q, k_rep, v_rep, o_pad)
+        ctx.graph = None if recompute else graph
+        del graph, o_pad
         ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v)
         return out
 
@@ -322,8 +337,6 @@ class AttentionBlock(torch.autograd.Function):
     def backward(ctx, dout):
         x, a, a_q, b_q, a_v, b_v = ctx.saved_tensors
         spec, pack = ctx.spec, ctx.pack
-        q, k_rep, v_rep, o_pad = ctx.graph
-        ctx.graph = None
         N, D = x.shape
         HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
         QD, KD = HQ * HD, HK * HD
@@ -333,6 +346,12 @@ class AttentionBlock(torch.autograd.Function):
         r = a_q.shape[0]
         dout16 = dout.to(torch.float16).contiguous()
 
+        w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
+        if ctx.graph is None:      # recompute the attention half of the forward
+            q, k_rep, v_rep, o_pad = _attention_core(x, a, b_q, b_v, w_qkv, spec, pack)
+        else:
+            q, k_rep, v_rep, o_pad = ctx.graph
+            ctx.graph = None
         w_o = unpack_nf4(spec["o_w"])
         do = torch.mm(dout16, w_o)                              # [N, QD]
         del w_o
@@ -351,9 +370,8 @@ class AttentionBlock(torch.autograd.Function):
         dq_pre = dqkv[:, :QD]
         dv_pre = dqkv[:, QD + KD:]
         # LoRA: lq = scale * a_q @ b_q^T  (a_q = a[:, :r]), same for v
-        a16 = a
-        g_bq = (torch.mm(dq_pre.t(), a16[:, :r]).float() * scale)
-        g_bv = (torch.mm(dv_pre.t(), a16[:, r:]).float() * scale)
+        g_bq = (torch.mm(dq_pre.t(), a[:, :r]).float() * scale)
+        g_bv = (torch.mm(dv_pre.t(), a[:, r:]).float() * scale)
         da = torch.empty(N, 2 * r, device=dev, dtype=torch.float16)
         torch.mm(dq_pre, b_q.to(torch.float16), out=da[:, :r])
         torch.mm(dv_pre, b_v.to(torch.float16), out=da[:, r:])
@@ -372,14 +390,13 @@ class AttentionBlock(torch.autograd.Function):
         del xq, xv
         dx = None
         if ctx.needs_input_grad[0]:
-            w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
             dx_base = torch.mm(dqkv, w_qkv)                       # [N, D]
-            del w_qkv
             gq = torch.mm(da[:, :r], a_q.to(torch.float16))       # [N, D]
             gv = torch.mm(da[:, r:], a_v.to(torch.float16))
             if p > 0:
                 dx = masked_rows_bwd(dx_base, gq, gv, mq, mv, pack, torch.float16)
             else:
                 dx = dx_base + gq + gv
+        del w_qkv
         return dx, g_aq.to(a_q.dtype), g_bq.to(b_q.dtype), g_av.to(a_v.dtype), \
             g_bv.to(b_v.dtype), None, None

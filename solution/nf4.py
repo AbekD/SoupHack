@@ -12,9 +12,27 @@ one rounding to fp16), so the unpacked weight is the same.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+try:  # a plain fp32 multiply that the compiler may not fuse into an FMA with the next add
+    from triton.language.extra import libdevice as _libdevice
+except Exception:  # noqa: BLE001
+    _libdevice = None
+
+_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+_EXACT = _libdevice is not None and not _INTERPRET
+
+
+@triton.jit
+def _mul_rn(a, b, EXACT: tl.constexpr):
+    if EXACT:
+        return _libdevice.mul_rn(a, b)
+    else:
+        return a * b
 
 
 @triton.jit
@@ -30,24 +48,31 @@ def nf4_unpack_kernel(
     BLOCKSIZE: tl.constexpr,      # values per absmax (64)
     NESTED_BLOCK: tl.constexpr,   # absmax values per nested scale (256)
     NESTED: tl.constexpr,
+    EXACT: tl.constexpr,
     BYTES: tl.constexpr,          # bytes handled by one program
 ):
     pid = tl.program_id(0).to(tl.int64)
     byte = pid * BYTES + tl.arange(0, BYTES)
     in_range = byte * 2 < n_values
     packed = tl.load(packed_ptr + byte, mask=in_range, other=0).to(tl.int32)
-    first = 2 * byte                       # value index of the high nibble
-    block = first // BLOCKSIZE             # both nibbles of a byte share a block (BLOCKSIZE even)
+    block = (2 * byte) // BLOCKSIZE        # both nibbles of a byte share a block (BLOCKSIZE even)
     if NESTED:
+        # bitsandbytes: absmax = dequantize_blockwise(...) (an fp32 product, stored), then
+        # absmax += offset (a separate add). Two roundings, never an FMA.
         q = tl.load(absmax_ptr + block, mask=in_range, other=0).to(tl.int32)
         scale2 = tl.load(absmax2_ptr + block // NESTED_BLOCK, mask=in_range, other=0.0)
-        absmax = tl.load(code2_ptr + q) * scale2 + offset
+        absmax = _mul_rn(tl.load(code2_ptr + q), scale2, EXACT) + offset
     else:
         absmax = tl.load(absmax_ptr + block, mask=in_range, other=0.0).to(tl.float32)
-    hi = tl.load(code_ptr + (packed >> 4)) * absmax
-    lo = tl.load(code_ptr + (packed & 15)) * absmax
-    tl.store(out_ptr + first, hi.to(tl.float16), mask=in_range)
-    tl.store(out_ptr + first + 1, lo.to(tl.float16), mask=(first + 1 < n_values) & in_range)
+    hi = (tl.load(code_ptr + (packed >> 4)) * absmax).to(tl.float16)
+    lo = (tl.load(code_ptr + (packed & 15)) * absmax).to(tl.float16)
+    # the two fp16 values of a byte as one 32-bit word (little endian: hi first), so each lane
+    # writes 4 contiguous bytes and the stores vectorise
+    hi_bits = hi.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    lo_bits = lo.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    word = hi_bits | (lo_bits << 16)
+    out32 = out_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(out32 + byte, word, mask=in_range)
 
 
 _STATE_CACHE = {}
@@ -95,11 +120,12 @@ def unpack_nf4(weight, out=None):
     if out is None:
         out = torch.empty(st["shape"], device=weight.device, dtype=torch.float16)
     assert out.is_contiguous() and out.numel() == n and out.dtype == torch.float16
-    bytes_per_prog = 1024
+    assert n % 2 == 0 and out.data_ptr() % 4 == 0
+    bytes_per_prog = 2048
     grid = (triton.cdiv((n + 1) // 2, bytes_per_prog),)
     nf4_unpack_kernel[grid](
         st["packed"], st["absmax"], st["absmax2"], st["code2"], st["code"], out,
         st["offset"], n,
         BLOCKSIZE=st["blocksize"], NESTED_BLOCK=st["nested_block"], NESTED=st["nested"],
-        BYTES=bytes_per_prog, num_warps=4)
+        EXACT=_EXACT, BYTES=bytes_per_prog, num_warps=4)
     return out

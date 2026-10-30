@@ -16,8 +16,20 @@ from .rmsnorm import rmsnorm
 from .stack import stack_forward, stack_supported
 
 # knobs (fixed for the measured run)
-MLP_RECOMPUTE = False
-USE_STACK = True    # our own pad-free decoder stack (attention + MLP + norms)
+import os as _os
+
+
+def _knob(name, default):
+    # development switches for A/B runs; the submitted run uses the defaults written here
+    value = _os.environ.get(f"SOUP_KERNELS_{name}")
+    return default if value is None else value not in ("0", "false", "False", "")
+
+
+MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", True)     # keep x, recompute gate/up in the backward
+ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", True)
+HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "256"))  # rows per lm_head chunk
+   # keep x and LoRA-A out, recompute q/k/v + SDPA
+USE_STACK = _knob("USE_STACK", True)    # our own pad-free decoder stack (attention + MLP + norms)
 ALLOW_CPU = False  # only for our CPU tests under TRITON_INTERPRET=1
 
 
@@ -110,10 +122,12 @@ def _patch_causal_lm():
                             logits_to_keep=logits_to_keep, **kwargs)
         if USE_STACK and input_ids is not None and inputs_embeds is None \
                 and position_ids is None and past_key_values is None and _stack_ok(self.model):
-            y, pack = stack_forward(self.model, input_ids, attention_mask, MLP_RECOMPUTE)
+            y, pack = stack_forward(self.model, input_ids, attention_mask, MLP_RECOMPUTE,
+                                     ATTN_RECOMPUTE)
             if y is not None:
                 loss, tok_ent, tok_loss, hits, labelled = fused_head_loss_packed(
-                    y, self.lm_head.weight, labels, pack, kwargs.get("num_items_in_batch"))
+                    y, self.lm_head.weight, labels, pack, kwargs.get("num_items_in_batch"),
+                    chunk=HEAD_CHUNK)
                 setattr(self, _STEP_ATTR, types.SimpleNamespace(
                     token_entropy=tok_ent, token_loss=tok_loss, correct=hits,
                     labelled=labelled))

@@ -19,18 +19,6 @@ from .mlp import NF4MLP
 from .nf4 import is_nf4
 from .rmsnorm import rmsnorm_bwd, rmsnorm_fwd
 
-_GEN = None
-
-
-def _seed():
-    """Dropout seeds from a private generator: no draw from the global CPU / CUDA RNG streams."""
-    global _GEN
-    if _GEN is None:
-        _GEN = torch.Generator()
-        _GEN.manual_seed(torch.initial_seed() ^ 0x5EED)
-    return int(torch.randint(0, 2**31 - 1, (1,), generator=_GEN).item())
-
-
 class AddRMSNorm(torch.autograd.Function):
     """h_out = h + delta (fp32 residual stream), y = rmsnorm(h_out) in fp16.
 
@@ -149,7 +137,6 @@ def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False):
     eps = cfg.rms_norm_eps
     for layer in qwen2_model.layers:
         spec, (aq, bq, av, bv) = _layer_spec(layer, cfg, inv_freq)
-        spec["seed"] = _seed() if spec["p"] > 0 and qwen2_model.training else 0
         if not qwen2_model.training:
             spec["p"] = 0.0
         h, y = AddRMSNorm.apply(h, delta, layer.input_layernorm.weight, eps)

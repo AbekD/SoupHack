@@ -233,3 +233,27 @@ def fused_head_loss(hidden, weight16, labels, attention_mask=None, num_items_in_
     loss, tok_ent, tok_loss, hits = FusedHeadLoss.apply(
         hidden, weight16, targets, active, denominator, chunk)
     return loss, tok_ent, tok_loss, hits, n_labelled
+
+
+def fused_head_loss_packed(hidden, weight16, labels, pack, num_items_in_batch=None,
+                           chunk=DEFAULT_CHUNK):
+    """The same on pad-free tokens: hidden [N, D] holds the rows `pack.dst` of the padded
+    [B, T] batch. Per-token results come back in the padded [B, T] layout (zeros at pads)."""
+    B, T = labels.shape
+    targets = shift_labels(labels).to(hidden.device).reshape(-1).index_select(0, pack.dst)
+    n_labelled = (targets != IGNORE_INDEX).sum()
+    if num_items_in_batch is None:
+        denominator = n_labelled
+    elif torch.is_tensor(num_items_in_batch):
+        denominator = num_items_in_batch.to(hidden.device)
+    else:
+        denominator = num_items_in_batch
+    n = hidden.shape[0]
+    active = torch.ones(1, n, dtype=torch.bool, device=hidden.device)
+    loss, ent_p, loss_p, hits = FusedHeadLoss.apply(
+        hidden.unsqueeze(0), weight16, targets.unsqueeze(0), active, denominator, chunk)
+    tok_ent = torch.zeros(B * T, device=hidden.device, dtype=torch.float32)
+    tok_loss = torch.zeros(B * T, device=hidden.device, dtype=torch.float32)
+    tok_ent.index_copy_(0, pack.dst, ent_p.reshape(-1))
+    tok_loss.index_copy_(0, pack.dst, loss_p.reshape(-1))
+    return loss, tok_ent.view(B, T), tok_loss.view(B, T), hits, n_labelled

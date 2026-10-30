@@ -9,13 +9,15 @@ import types
 
 import torch
 
-from .fused_head import fused_head_loss
+from .fused_head import fused_head_loss, fused_head_loss_packed
 from .mlp import nf4_mlp
 from .nf4 import is_nf4
 from .rmsnorm import rmsnorm
+from .stack import stack_forward, stack_supported
 
 # knobs (fixed for the measured run)
 MLP_RECOMPUTE = False
+USE_STACK = True    # our own pad-free decoder stack (attention + MLP + norms)
 ALLOW_CPU = False  # only for our CPU tests under TRITON_INTERPRET=1
 
 
@@ -80,6 +82,17 @@ def prepare_model(model):
 
 # --------------------------------------------------------------------------- module patches
 
+def _stack_ok(qwen2_model):
+    ok = getattr(qwen2_model, "_soup_stack_ok", None)
+    if ok is None:
+        try:
+            ok = bool(stack_supported(qwen2_model))
+        except Exception:  # noqa: BLE001
+            ok = False
+        qwen2_model._soup_stack_ok = ok
+    return ok
+
+
 def _patch_causal_lm():
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2
@@ -95,6 +108,16 @@ def _patch_causal_lm():
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
+        if USE_STACK and input_ids is not None and inputs_embeds is None \
+                and position_ids is None and past_key_values is None and _stack_ok(self.model):
+            y, pack = stack_forward(self.model, input_ids, attention_mask, MLP_RECOMPUTE)
+            if y is not None:
+                loss, tok_ent, tok_loss, hits, labelled = fused_head_loss_packed(
+                    y, self.lm_head.weight, labels, pack, kwargs.get("num_items_in_batch"))
+                setattr(self, _STEP_ATTR, types.SimpleNamespace(
+                    token_entropy=tok_ent, token_loss=tok_loss, correct=hits,
+                    labelled=labelled))
+                return CausalLMOutputWithPast(loss=loss, logits=None)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
                              position_ids=position_ids, past_key_values=past_key_values,
                              inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)

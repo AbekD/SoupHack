@@ -9,9 +9,8 @@ output and o_proj's input. Here:
 
   * q, k, v come from one tensor-core GEMM over the three NF4 weights unpacked side by side
     (our NF4 kernel), with the fp16 bias in the GEMM epilogue as bitsandbytes' F.linear does;
-  * LoRA dropout is a Triton kernel driven by a Philox seed: the mask is never stored, the
-    backward regenerates it;
-  * both LoRA A matrices run as one [N, 32] GEMM;
+  * LoRA dropout uses the very masks the base run draws (same CUDA RNG calls), applied to the
+    packed rows in Triton; the backward replays the RNG state instead of storing masks;
   * one Triton kernel adds the LoRA outputs, applies RoPE in fp32 (angles from the position and
     inv_freq, as Qwen2RotaryEmbedding computes them) and scatters q / k / v into the padded
     [B, H, T, 128] layout attention wants; a second one is its exact transpose for the backward;
@@ -32,46 +31,80 @@ import triton.language as tl
 from .nf4 import nf4_shape, unpack_nf4
 
 
-# ----------------------------------------------------------------------------- dropout (Philox)
+# ----------------------------------------------------------------------------- LoRA dropout
+
+# The base run applies nn.Dropout(0.05) to the fp32 [B, T, D] norm output, once for q_proj's
+# LoRA and once for v_proj's, in that order, in every layer: two draws from the CUDA RNG stream
+# per layer. We make the same two draws on a [B, T, D] fp32 tensor of ones, so the masks are the
+# very masks the base run uses, and apply them to the packed fp16 rows in Triton. The RNG state
+# is recorded, and the backward replays it to rebuild the masks instead of storing them.
 
 @triton.jit
-def philox_dropout_kernel(x_ptr, out_ptr, n, p, scale, seed, BLOCK: tl.constexpr):
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    keep = tl.rand(seed, offs) >= p
-    tl.store(out_ptr + offs, tl.where(keep, x * scale, 0.0).to(out_ptr.dtype.element_ty),
-             mask=mask)
+def masked_rows_kernel(x_ptr, mq_ptr, mv_ptr, dst_ptr, xq_ptr, xv_ptr, D,
+                       BLOCK: tl.constexpr):
+    # xq[n] = x[n] * mq[dst[n]], xv[n] = x[n] * mv[dst[n]]   (masks hold 0 or 1/(1-p))
+    tok = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    keep = cols < D
+    src = tl.load(dst_ptr + tok)
+    x = tl.load(x_ptr + tok * D + cols, mask=keep, other=0.0).to(tl.float32)
+    mq = tl.load(mq_ptr + src * D + cols, mask=keep, other=0.0)
+    mv = tl.load(mv_ptr + src * D + cols, mask=keep, other=0.0)
+    tl.store(xq_ptr + tok * D + cols, (x * mq).to(tl.float16), mask=keep)
+    tl.store(xv_ptr + tok * D + cols, (x * mv).to(tl.float16), mask=keep)
 
 
 @triton.jit
-def philox_dropout_bwd_add_kernel(g_ptr, base_ptr, out_ptr, n, p, scale, seed,
-                                  BLOCK: tl.constexpr):
-    # out = base + dropout_mask(seed) * g * scale   (fp32 math, one rounding)
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    g = tl.load(g_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(base_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    keep = tl.rand(seed, offs) >= p
-    tl.store(out_ptr + offs, (b + tl.where(keep, g * scale, 0.0)).to(out_ptr.dtype.element_ty),
-             mask=mask)
+def masked_rows_bwd_kernel(base_ptr, gq_ptr, gv_ptr, mq_ptr, mv_ptr, dst_ptr, out_ptr, D,
+                           BLOCK: tl.constexpr):
+    # out[n] = base[n] + gq[n] * mq[dst[n]] + gv[n] * mv[dst[n]]   (fp32 math, one rounding)
+    tok = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    keep = cols < D
+    src = tl.load(dst_ptr + tok)
+    b = tl.load(base_ptr + tok * D + cols, mask=keep, other=0.0).to(tl.float32)
+    gq = tl.load(gq_ptr + tok * D + cols, mask=keep, other=0.0).to(tl.float32)
+    gv = tl.load(gv_ptr + tok * D + cols, mask=keep, other=0.0).to(tl.float32)
+    mq = tl.load(mq_ptr + src * D + cols, mask=keep, other=0.0)
+    mv = tl.load(mv_ptr + src * D + cols, mask=keep, other=0.0)
+    tl.store(out_ptr + tok * D + cols, (b + gq * mq + gv * mv).to(out_ptr.dtype.element_ty),
+             mask=keep)
 
 
-def dropout_fwd(x, p, seed):
-    out = torch.empty_like(x)
-    n = x.numel()
-    if n:
-        philox_dropout_kernel[(triton.cdiv(n, 2048),)](x, out, n, p, 1.0 / (1.0 - p), seed,
-                                                       BLOCK=2048, num_warps=4)
-    return out
+def _rng_state(device):
+    return torch.cuda.get_rng_state(device) if device.type == "cuda" else torch.get_rng_state()
 
 
-def dropout_bwd_add(g, base, p, seed, out_dtype):
-    out = torch.empty(base.shape, device=base.device, dtype=out_dtype)
-    n = base.numel()
-    if n:
-        philox_dropout_bwd_add_kernel[(triton.cdiv(n, 2048),)](g, base, out, n, p, 1.0 / (1.0 - p),
-                                                               seed, BLOCK=2048, num_warps=4)
+def _set_rng_state(state, device):
+    if device.type == "cuda":
+        torch.cuda.set_rng_state(state, device)
+    else:
+        torch.set_rng_state(state)
+
+
+def draw_masks(pack, D, p, device):
+    """The two LoRA dropout masks of one layer as the base run draws them: [B*T, D] fp32."""
+    ones = torch.ones(pack.B * pack.T, D, device=device, dtype=torch.float32)
+    mq = torch.nn.functional.dropout(ones, p, True)
+    mv = torch.nn.functional.dropout(ones, p, True)
+    return mq, mv
+
+
+def masked_rows(x, mq, mv, pack):
+    N, D = x.shape
+    xq, xv = torch.empty_like(x), torch.empty_like(x)
+    if N:
+        masked_rows_kernel[(N,)](x, mq, mv, pack.dst, xq, xv, D,
+                                 BLOCK=triton.next_power_of_2(D), num_warps=4)
+    return xq, xv
+
+
+def masked_rows_bwd(base, gq, gv, mq, mv, pack, out_dtype):
+    N, D = base.shape
+    out = torch.empty(N, D, device=base.device, dtype=out_dtype)
+    if N:
+        masked_rows_bwd_kernel[(N,)](base, gq, gv, mq, mv, pack.dst, out, D,
+                                     BLOCK=triton.next_power_of_2(D), num_warps=4)
     return out
 
 
@@ -236,17 +269,25 @@ class AttentionBlock(torch.autograd.Function):
         QD, KD = HQ * HD, HK * HD
         B, T = pack.B, pack.T
         dev = x.device
-        p, scale, seed = spec["p"], spec["scaling"], spec["seed"]
+        p, scale = spec["p"], spec["scaling"]
         with torch.autocast(device_type=dev.type, enabled=False):
             w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
             qkv = torch.addmm(spec["bias16"], x, w_qkv.t()) if spec["bias16"] is not None \
                 else torch.mm(x, w_qkv.t())
             del w_qkv
-            xd = dropout_fwd(x, p, seed) if p > 0 else x
-            a_cat = torch.cat([a_q, a_v]).to(torch.float16)       # [2r, D]
-            a = torch.mm(xd, a_cat.t())                           # [N, 2r] fp16
-            del xd
             r = a_q.shape[0]
+            a = torch.empty(N, 2 * r, device=dev, dtype=torch.float16)
+            rng = None
+            if p > 0:
+                rng = _rng_state(dev)
+                mq, mv = draw_masks(pack, D, p, dev)
+                xq, xv = masked_rows(x, mq, mv, pack)
+                del mq, mv
+            else:
+                xq = xv = x
+            torch.mm(xq, a_q.to(torch.float16).t(), out=a[:, :r])
+            torch.mm(xv, a_v.to(torch.float16).t(), out=a[:, r:])
+            del xq, xv
             lq = torch.mm(a[:, :r], b_q.to(torch.float16).t())   # [N, QD]
             lv = torch.mm(a[:, r:], b_v.to(torch.float16).t())   # [N, KD]
             q = torch.zeros(B, HQ, T, HD, device=dev, dtype=torch.float16)
@@ -267,12 +308,12 @@ class AttentionBlock(torch.autograd.Function):
                     q, k_rep, v_rep, is_causal=True, scale=spec["softmax_scale"])
             o = torch.empty(N, QD, device=dev, dtype=torch.float16)
             if N:
-                gather_rows_kernel[(N, HQ)](o_pad.detach(), pack.dst, o, T, H=HQ, HD=HD,
+                gather_rows_kernel[(N, HQ)](o_pad.detach().contiguous(), pack.dst, o, T, H=HQ, HD=HD,
                                             num_warps=1)
             w_o = unpack_nf4(spec["o_w"])
             out = torch.mm(o, w_o.t())
             del w_o, o
-        ctx.spec, ctx.pack = spec, pack
+        ctx.spec, ctx.pack, ctx.rng = spec, pack, rng
         ctx.graph = (q, k_rep, v_rep, o_pad)
         ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v)
         return out
@@ -288,7 +329,7 @@ class AttentionBlock(torch.autograd.Function):
         QD, KD = HQ * HD, HK * HD
         B, T = pack.B, pack.T
         dev = x.device
-        p, scale, seed = spec["p"], spec["scaling"], spec["seed"]
+        p, scale = spec["p"], spec["scaling"]
         r = a_q.shape[0]
         dout16 = dout.to(torch.float16).contiguous()
 
@@ -301,6 +342,7 @@ class AttentionBlock(torch.autograd.Function):
         del do
         dq, dk, dv = torch.autograd.grad(o_pad, (q, k_rep, v_rep), do_pad)
         del do_pad, o_pad, q, k_rep, v_rep
+        dq, dk, dv = dq.contiguous(), dk.contiguous(), dv.contiguous()
         dqkv = torch.empty(N, QD + 2 * KD, device=dev, dtype=torch.float16)
         if N:
             rope_unpack_bwd_kernel[(N,)](dq, dk, dv, pack.pos, pack.dst, spec["inv_freq"], dqkv,
@@ -316,20 +358,28 @@ class AttentionBlock(torch.autograd.Function):
         torch.mm(dq_pre, b_q.to(torch.float16), out=da[:, :r])
         torch.mm(dv_pre, b_v.to(torch.float16), out=da[:, r:])
         da.mul_(scale)
-        xd = dropout_fwd(x, p, seed) if p > 0 else x
-        g_a = torch.mm(da.t(), xd).float()                       # [2r, D]
-        del xd
-        g_aq, g_av = g_a[:r], g_a[r:]
+        if p > 0:
+            current = _rng_state(dev)
+            _set_rng_state(ctx.rng, dev)
+            mq, mv = draw_masks(pack, D, p, dev)
+            _set_rng_state(current, dev)
+            xq, xv = masked_rows(x, mq, mv, pack)
+        else:
+            mq = mv = None
+            xq = xv = x
+        g_aq = torch.mm(da[:, :r].t(), xq).float()                # [r, D]
+        g_av = torch.mm(da[:, r:].t(), xv).float()
+        del xq, xv
         dx = None
         if ctx.needs_input_grad[0]:
             w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
             dx_base = torch.mm(dqkv, w_qkv)                       # [N, D]
             del w_qkv
-            a_cat = torch.cat([a_q, a_v]).to(torch.float16)
-            dxd = torch.mm(da, a_cat)                              # [N, D]
+            gq = torch.mm(da[:, :r], a_q.to(torch.float16))       # [N, D]
+            gv = torch.mm(da[:, r:], a_v.to(torch.float16))
             if p > 0:
-                dx = dropout_bwd_add(dxd, dx_base, p, seed, torch.float16)
+                dx = masked_rows_bwd(dx_base, gq, gv, mq, mv, pack, torch.float16)
             else:
-                dx = dx_base + dxd
+                dx = dx_base + gq + gv
         return dx, g_aq.to(a_q.dtype), g_bq.to(b_q.dtype), g_av.to(a_v.dtype), \
             g_bv.to(b_v.dtype), None, None

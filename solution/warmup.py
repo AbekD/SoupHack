@@ -23,7 +23,8 @@ import torch
 _THREAD = None
 
 
-def _variants():
+def _variants(mlp_mode="int8"):
+    """Only the variants this run's settings launch (MLP: int8 or fp16 activations)."""
     from .attention import (masked_rows_bwd_kernel, masked_rows_kernel, rope_inverse_kernel,
                             rope_lora_kernel)
     from .fused_head import GRAD_SCALE, head_row_stats_kernel
@@ -55,12 +56,15 @@ def _variants():
         (rope_lora_kernel, (f16, f16, f16, i32, f32, 2.0), dict(HQ=HQ, HK=HK, HD=HD, num_warps=2)),
         (rope_inverse_kernel, (f16, i32, f32), dict(HQ=HQ, HK=HK, HD=HD, num_warps=2)),
         # MLP
-        (gated_silu_rows_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
-        (gated_silu_rows_bwd_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
+    ] + ([
         (gated_silu_q8_kernel, (f16, f16, i8, f32, 2 * I, I, 2 * I, 2 * (I // Q8_SUB), I),
          dict(BLOCK_I=BLOCK_I, SUB=Q8_SUB, num_warps=4)),
         (gated_silu_q8_bwd_kernel, (i8, f32, f16, f16, 2 * I, 2 * (I // Q8_SUB), I, 2 * I, I),
          dict(BLOCK_I=BLOCK_I, SUB=Q8_SUB, num_warps=4)),
+    ] if mlp_mode == "int8" else [
+        (gated_silu_rows_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
+        (gated_silu_rows_bwd_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
+    ]) + [
         # output head: labelled rows (with gradient) and the other rows (entropy only)
         (head_row_stats_kernel, (f32, V, f16, 2 * V, i64, f32, f32, f32, i32, V, GRAD_SCALE),
          dict(WRITE_GRAD=True, BLOCK=2048, num_warps=8)),
@@ -72,7 +76,8 @@ def _variants():
 def _run():
     try:
         torch.cuda.set_device(0)
-        variants, grid = _variants()
+        from .patches import _mlp_mode
+        variants, grid = _variants(_mlp_mode())
     except Exception:  # noqa: BLE001 - warming up is an optimisation, never a failure
         return
     for kernel, args, kwargs in variants:

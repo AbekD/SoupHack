@@ -191,6 +191,8 @@ class PackInfo:
             mask, torch.arange(self.T)[None, :] < lengths[:, None]))
         flat = mask.reshape(-1).nonzero().squeeze(1)
         self.N = flat.numel()
+        self.lengths = [int(n) for n in lengths.tolist()]   # real tokens of each row
+        self.starts = [sum(self.lengths[:b]) for b in range(self.B)]
         parts = [flat, flat % self.T]
         self.n_lab = self.n_rest = None
         if labels is not None:
@@ -228,27 +230,19 @@ def dense_qkv(q_w, k_w, v_w):
     return buf
 
 
-def _padded(rows, pack, heads, head_dim, repeat=1):
-    """Packed rows [N, heads*hd] -> [B, heads*repeat, T, hd] as a transposed view of a
-    [B, T, H, hd] buffer, zeros at pad positions (each kv head repeated `repeat` times)."""
-    B, T = pack.B, pack.T
-    buf = rows.new_zeros(B * T, heads * head_dim)
-    buf.index_copy_(0, pack.dst, rows)
-    t = buf.view(B, T, heads, head_dim)
+def _row_heads(rows, heads, head_dim, repeat=1):
+    """Packed rows of one sequence [L, heads*hd] -> [1, heads*repeat, L, hd] (a view when
+    repeat == 1; each kv head repeated `repeat` times otherwise)."""
+    L = rows.shape[0]
+    t = rows.view(L, heads, head_dim)
     if repeat > 1:
-        t = t.unsqueeze(3).expand(B, T, heads, repeat, head_dim).reshape(B, T, heads * repeat,
-                                                                          head_dim)
-    return t.transpose(1, 2)
+        t = t.unsqueeze(2).expand(L, heads, repeat, head_dim).reshape(L, heads * repeat, head_dim)
+    return t.transpose(0, 1).unsqueeze(0)
 
 
-def _packed(t, pack, group=1):
-    """[B, H, T, hd] (any layout) -> packed rows [N, H*hd / group], summing `group` adjacent
-    heads (the GQA reduction of k / v gradients)."""
-    B, H, T, HD = t.shape
-    rows = t.transpose(1, 2).reshape(B * T, H, HD)
-    if group > 1:
-        rows = rows.view(B * T, H // group, group, HD).sum(2, dtype=torch.float32).to(t.dtype)
-    return rows.reshape(B * T, -1).index_select(0, pack.dst)
+def _rows_of(t):
+    """[1, H, L, hd] -> [L, H*hd]."""
+    return t[0].transpose(0, 1).reshape(t.shape[2], -1)
 
 
 def _eff_attention_fwd(q, k, v, scale):
@@ -299,17 +293,45 @@ def _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack):
 
 
 def _attention_fwd(qkv, spec, pack):
-    """Causal attention of the packed rotated q / k / v. Returns (packed out [N, QD], lse, seed,
-    offset)."""
+    """Causal attention of the packed rotated q / k / v, one sequence at a time at its own
+    length (no padding, no cross-row mixing). Returns (packed out [N, QD], [(lse, seed, offset)]
+    per sequence)."""
     HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
     QD, KD = HQ * HD, HK * HD
     G = HQ // HK
-    q = _padded(qkv[:, :QD], pack, HQ, HD)
-    k = _padded(qkv[:, QD:QD + KD], pack, HK, HD, G)
-    v = _padded(qkv[:, QD + KD:], pack, HK, HD, G)
-    out, lse, seed, offset = _eff_attention_fwd(q, k, v, spec["softmax_scale"])
-    del q, k, v
-    return _packed(out, pack), lse, seed, offset
+    o = torch.empty(qkv.shape[0], QD, device=qkv.device, dtype=qkv.dtype)
+    stats = []
+    for s0, L in zip(pack.starts, pack.lengths):
+        if L == 0:
+            stats.append(None)
+            continue
+        rows = qkv[s0:s0 + L]
+        out, lse, seed, offset = _eff_attention_fwd(
+            _row_heads(rows[:, :QD], HQ, HD), _row_heads(rows[:, QD:QD + KD], HK, HD, G),
+            _row_heads(rows[:, QD + KD:], HK, HD, G), spec["softmax_scale"])
+        o[s0:s0 + L] = _rows_of(out)
+        stats.append((lse, seed, offset))
+    return o, stats
+
+
+def _attention_bwd(do, qkv, o, stats, spec, pack):
+    """d(q|k|v) of the rotated packed rows [N, QD + 2 KD] (k / v summed over their GQA group)."""
+    HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
+    QD, KD = HQ * HD, HK * HD
+    G = HQ // HK
+    dqkv = torch.empty_like(qkv)
+    for s0, L, st in zip(pack.starts, pack.lengths, stats):
+        if L == 0:
+            continue
+        rows = qkv[s0:s0 + L]
+        dq, dk, dv = _eff_attention_bwd(
+            _row_heads(do[s0:s0 + L], HQ, HD), _row_heads(rows[:, :QD], HQ, HD),
+            _row_heads(rows[:, QD:QD + KD], HK, HD, G), _row_heads(rows[:, QD + KD:], HK, HD, G),
+            _row_heads(o[s0:s0 + L], HQ, HD), st[0], st[1], st[2], spec["softmax_scale"])
+        dqkv[s0:s0 + L, :QD] = _rows_of(dq)
+        dqkv[s0:s0 + L, QD:QD + KD] = _rows_of(dk).view(L, HK, G, HD).sum(2).reshape(L, KD)
+        dqkv[s0:s0 + L, QD + KD:] = _rows_of(dv).view(L, HK, G, HD).sum(2).reshape(L, KD)
+    return dqkv
 
 
 class AttentionBlock(torch.autograd.Function):
@@ -338,16 +360,18 @@ class AttentionBlock(torch.autograd.Function):
             w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
             qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
             del w_qkv
-            o, lse, seed, offset = _attention_fwd(qkv, spec, pack)
+            o, stats = _attention_fwd(qkv, spec, pack)
             w_o = unpack_nf4(spec["o_w"])
             out = torch.mm(o, w_o.t())
             del w_o
         ctx.spec, ctx.pack, ctx.rng, ctx.recompute = spec, pack, rng, recompute
         if recompute:
-            del qkv, o, lse, seed, offset
+            del qkv, o, stats
+            ctx.stats = None
             ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v)
         else:
-            ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v, qkv, o, lse, seed, offset)
+            ctx.stats = stats
+            ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v, qkv, o)
         return out
 
     @staticmethod
@@ -367,23 +391,15 @@ class AttentionBlock(torch.autograd.Function):
         w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
         if ctx.recompute:          # recompute the attention half of the forward
             qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
-            o, lse, seed, offset = _attention_fwd(qkv, spec, pack)
+            o, stats = _attention_fwd(qkv, spec, pack)
         else:
-            qkv, o, lse, seed, offset = saved[6:]
+            qkv, o = saved[6:]
+            stats, ctx.stats = ctx.stats, None
         w_o = unpack_nf4(spec["o_w"])
         do = torch.mm(dout16, w_o)                              # [N, QD]
         del w_o
-        q = _padded(qkv[:, :QD], pack, HQ, HD)
-        k = _padded(qkv[:, QD:QD + KD], pack, HK, HD, G)
-        v = _padded(qkv[:, QD + KD:], pack, HK, HD, G)
-        out_p = _padded(o, pack, HQ, HD)
-        do_p = _padded(do, pack, HQ, HD)
-        del do, o
-        dq, dk, dv = _eff_attention_bwd(do_p, q, k, v, out_p, lse, seed, offset,
-                                        spec["softmax_scale"])
-        del q, k, v, out_p, do_p
-        dqkv = torch.cat([_packed(dq, pack), _packed(dk, pack, G), _packed(dv, pack, G)], dim=1)
-        del dq, dk, dv
+        dqkv = _attention_bwd(do, qkv, o, stats, spec, pack)
+        del do, o, qkv, stats
         if N:
             rope_inverse_kernel[(N,)](dqkv, pack.pos, spec["inv_freq"], HQ=HQ, HK=HK, HD=HD,
                                       num_warps=2)

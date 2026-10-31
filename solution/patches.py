@@ -422,6 +422,28 @@ def _patch_timelog():
             mark("train() returned (adapter saved)")
 
     sft.SFTTrainerWrapper.train = train_
+    try:
+        import soup_cli.commands.train as train_cmd
+        load_ds = train_cmd.load_dataset
+
+        def load_dataset(*args, **kwargs):
+            mark("load_dataset begins")
+            result = load_ds(*args, **kwargs)
+            mark("load_dataset done")
+            return result
+
+        train_cmd.load_dataset = load_dataset
+    except Exception as exc:  # noqa: BLE001
+        print(f"[timelog] no load_dataset hook: {exc!r}", flush=True)
+    wrapper_setup = sft.SFTTrainerWrapper.setup
+
+    def setup_(self, *args, **kwargs):
+        mark("wrapper.setup begins (data formatting + model + trainer)")
+        result = wrapper_setup(self, *args, **kwargs)
+        mark("wrapper.setup done")
+        return result
+
+    sft.SFTTrainerWrapper.setup = setup_
     step = trl.SFTTrainer.training_step
     count = [0]
 
@@ -446,13 +468,40 @@ def _patch_timelog():
                 if id(kernel) in seen:
                     continue
                 seen[id(kernel)] = True
-                counts = [len(cache[0]) for cache in kernel.device_caches.values()]
-                print(f"[timelog] compiled variants {kernel.__name__}: {counts}", flush=True)
+                counts = " ".join(str(len(cache[0])) for cache in kernel.device_caches.values())
+                print(f"[timelog] compiled variants {kernel.__name__}: {counts or 'none'}",
+                      flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[timelog] variant report failed: {exc!r}", flush=True)
 
     import atexit
     atexit.register(report)
+
+
+def _start_cprofile():
+    """Development only (SOUP_KERNELS_CPROFILE=1): profile the Python side of the whole run
+    (main thread, from apply() on) and print the heaviest functions at exit."""
+    if _os.environ.get("SOUP_KERNELS_CPROFILE") != "1":
+        return
+    import atexit
+    import cProfile
+    import io
+    import pstats
+
+    profile = cProfile.Profile()
+    profile.enable()
+
+    def dump():
+        profile.disable()
+        for key, count in (("cumulative", 60), ("tottime", 40)):
+            out = io.StringIO()
+            stats = pstats.Stats(profile, stream=out)
+            stats.sort_stats(key).print_stats(count)
+            for line in out.getvalue().splitlines():
+                if line.strip():
+                    print(f"[cprof:{key}] {line}", flush=True)
+
+    atexit.register(dump)
 
 
 def _patch_memlog():
@@ -493,6 +542,7 @@ def _patch_memlog():
 
 
 def apply_all():
+    _start_cprofile()
     _patch_timelog()
     _patch_memlog()
     _patch_kbit_prep()

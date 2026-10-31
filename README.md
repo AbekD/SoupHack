@@ -5,20 +5,21 @@ tokens, 64 steps) on a free Kaggle T4: **1.7× faster and 5.1× less GPU memory*
 adapter, same Soup outputs. Our own Triton kernels, a hand-written forward/backward of the decoder
 stack on pad-free tokens, and a few start-up fixes found by profiling the whole run.
 
-- **Kaggle notebook (public, saved version):** `<KAGGLE_LINK>`
-- **Final commit:** `<COMMIT_SHA>`
+- **Kaggle notebook (public, saved version):** https://www.kaggle.com/code/abekdr/notebookd836800e9b
+- **Final commit:** the sha in [`SUBMISSION.md`](SUBMISSION.md) (the `COMMIT` of the saved notebook)
 
 ## Results on a Kaggle T4
 
-Our notebook run of `harness/run_task.py --repeats 2` (base, ours, ours, base — the jury's order)
-and `harness/check_rules.py`:
+Our notebook run of `harness/run_task.py --repeats 2` (base, ours, ours, base — the jury's order,
+medians of two runs each) and `harness/check_rules.py`. Run to run, our time varies by about
+±2 s on Kaggle (44–50 s seen); the base by 75–84 s:
 
 | | Base Soup 0.77.0 | Ours | Ratio |
 |---|---|---|---|
-| Whole `soup train`, s | `<BASE_S>` | `<OURS_S>` | speedup **`<S>`×** |
-| Peak GPU memory (nvidia-smi), MiB | `<BASE_MIB>` | `<OURS_MIB>` | base/ours **`<M>`×** |
-| Eval loss, public rows 40000–40255 | `<BASE_LOSS>` | `<OURS_LOSS>` | `<DQ>` % |
-| Our kernels' share of training time (check 4) | — | `<SHARE>` % | needs ≥ 5 % |
+| Whole `soup train`, s | 82.1 | 49.1 | speedup **1.67×** |
+| Peak GPU memory (nvidia-smi), MiB | 14 345 | 2 795 | base/ours **5.13×** |
+| Eval loss, public rows 40000–40255 | 2.04972 | 2.04964 | −0.004 % |
+| Our kernels' share of training time (check 4) | — | 18.1 % | needs ≥ 5 % |
 
 All 10 checks pass: loss curve within 0.02 % of the base on the first step and 0.01 % on average;
 entropy, token accuracy and every `rewind.jsonl` row loss within tolerance; eval loss equal to the
@@ -36,7 +37,8 @@ Each row is a full notebook run on a T4 (base re-measured in the same session, 7
 | v7 | attention on each sequence's real length (no padding at all) | 51.1 | 2 813 |
 | v8 | start-up: faster `datasets` tokenizer fingerprint and trl metadata scan | 47.3 | 2 833 |
 | v9 | Triton launchers built + kernel binaries loaded in the background thread | 44.7 | 2 833 |
-| v10 | one variable-length attention call per layer; fused add+RMSNorm backward | **44.2** | **2 795** |
+| v10 | one variable-length attention call per layer; fused add+RMSNorm backward | 44.2 | 2 795 |
+| v10, `--repeats 2` | final run (table above) | **49.1** (base 82.1) | **2 795** |
 
 Things we measured and did **not** keep: recomputing MLP activations (−1.4 GB but +13 % time) and
 attention activations (−340 MB, +8 % time) — at our operating point speed points cost more than
@@ -168,10 +170,10 @@ memory-efficient kernel; those are not claimed as ours. No `torch.compile`, no C
 **On Kaggle (what the jury does):**
 1. Kaggle → *Create → New Notebook → File → Import Notebook* → `templates/kaggle_notebook.ipynb`.
 2. Settings: **Accelerator GPU T4 x2**, **Internet on**.
-3. First cell: `REPO_URL = "<REPO_URL>"`, `COMMIT = "<COMMIT_SHA>"`.
+3. First cell: `REPO_URL = "https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider.git"`, `COMMIT = "<the sha from SUBMISSION.md>"`.
 4. **Run All** (~10 minutes). The last cells print the result table and the 10 checks.
 
-Or open our saved public notebook: `<KAGGLE_LINK>`.
+Or open our saved public notebook: https://www.kaggle.com/code/abekdr/notebookd836800e9b.
 
 **Locally on a Linux machine with a T4:**
 ```bash

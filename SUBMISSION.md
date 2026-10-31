@@ -1,9 +1,9 @@
 # Submission: Agentic_Remaider
 
 ## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider/commit/<COMMIT_SHA>
+- Repository, final commit: https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider/commit/4ca7c41c6b8e2d7d5990948acb4297229f4fd4a5
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  our README): <KAGGLE_LINK>
+  our README): https://www.kaggle.com/code/abekdr/notebookd836800e9b
 - Demo video (up to 3 minutes): <VIDEO_LINK>
 - Presentation: <SLIDES_LINK>
 
@@ -15,7 +15,7 @@
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `nf4_unpack_kernel` | `solution/nf4.py` | bitsandbytes NF4 dequantisation (two launches) | together: `<SHARE>` % |
+| `nf4_unpack_kernel` | `solution/nf4.py` | bitsandbytes NF4 dequantisation (two launches) | together: 18.1 % |
 | `head_row_stats_kernel` | `solution/fused_head.py` | log_softmax / cross-entropy / entropy / argmax over full logits | |
 | `rmsnorm_fwd_kernel` | `solution/rmsnorm.py` | Qwen2RMSNorm + residual add | |
 | `add_rmsnorm_bwd_kernel` | `solution/rmsnorm.py` | their backward | |
@@ -36,9 +36,9 @@ ActNN activation compression (https://arxiv.org/abs/2104.14129).
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | `<BASE_S>` | `<OURS_S>` | speedup `<S>`x |
-| Peak GPU memory, MiB | `<BASE_MIB>` | `<OURS_MIB>` | base/ours `<M>`x |
-| Eval loss (public rows) | `<BASE_LOSS>` | `<OURS_LOSS>` | `<DQ>` % vs base |
+| Time of `soup train`, s | 82.1 | 49.1 | speedup 1.67x |
+| Peak GPU memory, MiB | 14 345 | 2 795 | base/ours 5.13x |
+| Eval loss (public rows) | 2.04972 | 2.04964 | −0.004 % vs base |
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits

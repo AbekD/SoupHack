@@ -17,7 +17,7 @@ import torch
 from .attention import AttentionBlock, PackInfo
 from .mlp import NF4MLP
 from .nf4 import is_nf4
-from .rmsnorm import rmsnorm_bwd, rmsnorm_fwd
+from .rmsnorm import add_rmsnorm_bwd, rmsnorm_fwd
 
 class AddRMSNorm(torch.autograd.Function):
     """h_out = h + delta (fp32 residual stream), y = rmsnorm(h_out) in fp16.
@@ -42,18 +42,14 @@ class AddRMSNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dh_out, dy):
         y, weight, rstd = ctx.saved_tensors
-        x_hat = y.float() / weight          # [N, D] fp32 temporary
-        # rmsnorm_bwd with x = x_hat and rstd = 1 gives (w*dy - x_hat*c), then * rstd per row
+        delta_dtype = ctx.delta_dtype if ctx.has_delta else None
         if dy is None:
-            dh = dh_out
-        else:
-            ones = torch.ones_like(rstd)
-            dxh = rmsnorm_bwd(dy.contiguous(), x_hat, weight, ones, torch.float32)
-            dh = dxh * rstd[:, None]
-            if dh_out is not None:
-                dh = dh + dh_out
-        del x_hat
-        ddelta = dh.to(ctx.delta_dtype) if ctx.has_delta else None
+            return dh_out, (dh_out.to(delta_dtype) if ctx.has_delta and dh_out is not None
+                            else None), None, None
+        dy = dy.contiguous()
+        if dh_out is not None:
+            dh_out = dh_out.contiguous()
+        dh, ddelta = add_rmsnorm_bwd(dy, y, weight, rstd, dh_out, delta_dtype)
         return dh, ddelta, None, None
 
 

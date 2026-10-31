@@ -193,6 +193,10 @@ class PackInfo:
         self.N = flat.numel()
         self.lengths = [int(n) for n in lengths.tolist()]   # real tokens of each row
         self.starts = [sum(self.lengths[:b]) for b in range(self.B)]
+        self.max_len = max(self.lengths) if self.lengths else 0
+        cu = torch.tensor(self.starts + [self.N], dtype=torch.int32)
+        self.cu_seqlens = (cu.pin_memory().to(device, non_blocking=True)
+                           if device.type == "cuda" else cu)
         parts = [flat, flat % self.T]
         self.n_lab = self.n_rest = None
         if labels is not None:
@@ -292,14 +296,32 @@ def _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack):
     return qkv
 
 
+import os as _os
+
+VARLEN = _os.environ.get("SOUP_KERNELS_VARLEN", "1") != "0"   # dev switch: 0 = one call per row
+
+
 def _attention_fwd(qkv, spec, pack):
-    """Causal attention of the packed rotated q / k / v, one sequence at a time at its own
-    length (no padding, no cross-row mixing). Returns (packed out [N, QD], [(lse, seed, offset)]
-    per sequence)."""
+    """Causal attention of the packed rotated q / k / v, every sequence at its own length (no
+    padding, no cross-row mixing). Returns (packed out [N, QD], state for the backward).
+
+    On CUDA one call of PyTorch's memory-efficient attention in its variable-length mode
+    (cumulative sequence lengths, causal mask per sequence) works straight on the packed rows;
+    only k / v are expanded to the 12 query heads (GQA) for the call. Elsewhere (our CPU tests)
+    the same computation one sequence at a time."""
     HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
     QD, KD = HQ * HD, HK * HD
     G = HQ // HK
-    o = torch.empty(qkv.shape[0], QD, device=qkv.device, dtype=qkv.dtype)
+    N = qkv.shape[0]
+    if qkv.is_cuda and VARLEN:
+        q = qkv[:, :QD].view(1, N, HQ, HD)
+        k = qkv[:, QD:QD + KD].view(N, HK, 1, HD).expand(N, HK, G, HD).reshape(1, N, HQ, HD)
+        v = qkv[:, QD + KD:].view(N, HK, 1, HD).expand(N, HK, G, HD).reshape(1, N, HQ, HD)
+        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+            q, k, v, None, pack.cu_seqlens, pack.cu_seqlens, pack.max_len, pack.max_len, 0.0, 1,
+            True, scale=spec["softmax_scale"])
+        return out.reshape(N, QD), (lse, seed, offset)
+    o = torch.empty(N, QD, device=qkv.device, dtype=qkv.dtype)
     stats = []
     for s0, L in zip(pack.starts, pack.lengths):
         if L == 0:
@@ -319,6 +341,19 @@ def _attention_bwd(do, qkv, o, stats, spec, pack):
     HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
     QD, KD = HQ * HD, HK * HD
     G = HQ // HK
+    N = qkv.shape[0]
+    if qkv.is_cuda and VARLEN:
+        lse, seed, offset = stats
+        q = qkv[:, :QD].view(1, N, HQ, HD)
+        k = qkv[:, QD:QD + KD].view(N, HK, 1, HD).expand(N, HK, G, HD).reshape(1, N, HQ, HD)
+        v = qkv[:, QD + KD:].view(N, HK, 1, HD).expand(N, HK, G, HD).reshape(1, N, HQ, HD)
+        dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
+            do.view(1, N, HQ, HD), q, k, v, None, o.view(1, N, HQ, HD), pack.cu_seqlens,
+            pack.cu_seqlens, pack.max_len, pack.max_len, lse, 0.0, seed, offset, 1, False,
+            scale=spec["softmax_scale"])
+        del q, k, v
+        return torch.cat([dq.reshape(N, QD), dk.reshape(N, HK, G, HD).sum(2).view(N, KD),
+                          dv.reshape(N, HK, G, HD).sum(2).view(N, KD)], dim=1)
     dqkv = torch.empty_like(qkv)
     for s0, L, st in zip(pack.starts, pack.lengths, stats):
         if L == 0:
@@ -354,17 +389,21 @@ class AttentionBlock(torch.autograd.Function):
                 del mq, mv
             else:
                 xq = xv = x
-            torch.mm(xq, a_q.to(torch.float16).t(), out=a[:, :r])
-            torch.mm(xv, a_v.to(torch.float16).t(), out=a[:, r:])
+            # fp16 copies of the four LoRA matrices, made once per step and layer and reused by
+            # the backward (the trainable fp32 weights do not change in between)
+            half = tuple(t.to(torch.float16) for t in (a_q, b_q, a_v, b_v))
+            torch.mm(xq, half[0].t(), out=a[:, :r])
+            torch.mm(xv, half[2].t(), out=a[:, r:])
             del xq, xv
             w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
-            qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
+            qkv = _qkv_rotated(x, a, half[1], half[3], w_qkv, spec, pack)
             del w_qkv
             o, stats = _attention_fwd(qkv, spec, pack)
             w_o = unpack_nf4(spec["o_w"])
             out = torch.mm(o, w_o.t())
             del w_o
         ctx.spec, ctx.pack, ctx.rng, ctx.recompute = spec, pack, rng, recompute
+        ctx.half = half
         if recompute:
             del qkv, o, stats
             ctx.stats = None
@@ -389,8 +428,9 @@ class AttentionBlock(torch.autograd.Function):
         dout16 = dout.to(torch.float16).contiguous()
 
         w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
+        half, ctx.half = ctx.half, None
         if ctx.recompute:          # recompute the attention half of the forward
-            qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
+            qkv = _qkv_rotated(x, a, half[1], half[3], w_qkv, spec, pack)
             o, stats = _attention_fwd(qkv, spec, pack)
         else:
             qkv, o = saved[6:]
@@ -409,8 +449,8 @@ class AttentionBlock(torch.autograd.Function):
         g_bq = (torch.mm(dq_pre.t(), a[:, :r]).float() * scale)
         g_bv = (torch.mm(dv_pre.t(), a[:, r:]).float() * scale)
         da = torch.empty(N, 2 * r, device=dev, dtype=torch.float16)
-        torch.mm(dq_pre, b_q.to(torch.float16), out=da[:, :r])
-        torch.mm(dv_pre, b_v.to(torch.float16), out=da[:, r:])
+        torch.mm(dq_pre, half[1], out=da[:, :r])
+        torch.mm(dv_pre, half[3], out=da[:, r:])
         da.mul_(scale)
         if p > 0:
             current = _rng_state(dev)
@@ -427,8 +467,8 @@ class AttentionBlock(torch.autograd.Function):
         dx = None
         if ctx.needs_input_grad[0]:
             dx_base = torch.mm(dqkv, w_qkv)                       # [N, D]
-            gq = torch.mm(da[:, :r], a_q.to(torch.float16))       # [N, D]
-            gv = torch.mm(da[:, r:], a_v.to(torch.float16))
+            gq = torch.mm(da[:, :r], half[0])                     # [N, D]
+            gv = torch.mm(da[:, r:], half[2])
             if p > 0:
                 dx = masked_rows_bwd(dx_base, gq, gv, mq, mv, pack, torch.float16)
             else:

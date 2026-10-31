@@ -63,6 +63,45 @@ def rmsnorm_bwd_kernel(
     tl.store(dx_ptr + row * stride_dx + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def add_rmsnorm_bwd_kernel(
+    dy_ptr, y_ptr, w_ptr, rstd_ptr, dres_ptr, dh_ptr, dd_ptr, N,
+    HAS_DRES: tl.constexpr, WRITE_DD: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # backward of h_out = h + delta, y = rmsnorm(h_out) (all rows contiguous, N values each):
+    # x_hat = y / w (from the saved fp16 output), dh = rstd * (w*dy - x_hat * mean(w*dy*x_hat))
+    # (+ the residual stream's own gradient), written in fp32 for h and in fp16 for delta
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    dy = tl.load(dy_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask, other=1.0).to(tl.float32)
+    x_hat = tl.load(y_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32) / w
+    rstd = tl.load(rstd_ptr + row)
+    wdy = w * dy
+    c = tl.sum(wdy * x_hat, axis=0) / N
+    dh = (wdy - x_hat * c) * rstd
+    if HAS_DRES:
+        dh += tl.load(dres_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(dh_ptr + row * N + cols, dh, mask=mask)
+    if WRITE_DD:
+        tl.store(dd_ptr + row * N + cols, dh.to(dd_ptr.dtype.element_ty), mask=mask)
+
+
+def add_rmsnorm_bwd(dy, y, weight, rstd, dres, delta_dtype):
+    """(dh fp32, ddelta in delta_dtype or None) in one launch."""
+    rows, n = y.shape
+    dh = torch.empty(rows, n, device=y.device, dtype=torch.float32)
+    dd = torch.empty(rows, n, device=y.device, dtype=delta_dtype) if delta_dtype is not None \
+        else dh
+    if rows:
+        add_rmsnorm_bwd_kernel[(rows,)](
+            dy, y, weight, rstd, dres if dres is not None else dh, dh, dd, n,
+            HAS_DRES=dres is not None, WRITE_DD=delta_dtype is not None, BLOCK=_block(n),
+            num_warps=4)
+    return dh, (dd if delta_dtype is not None else None)
+
+
 def _block(n):
     return triton.next_power_of_2(n)
 

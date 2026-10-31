@@ -32,7 +32,7 @@ def _variants(mlp_mode="int8"):
     from .mlp import (BLOCK_I, Q8_SUB, gated_silu_q8_bwd_kernel, gated_silu_q8_kernel,
                       gated_silu_rows_bwd_kernel, gated_silu_rows_kernel)
     from .nf4 import _EXACT, nf4_unpack_kernel
-    from .rmsnorm import rmsnorm_bwd_kernel, rmsnorm_fwd_kernel
+    from .rmsnorm import add_rmsnorm_bwd_kernel, rmsnorm_fwd_kernel
 
     f16, f32, i32, i64, u8 = torch.float16, torch.float32, torch.int32, torch.int64, torch.uint8
     i8 = torch.int8
@@ -48,8 +48,10 @@ def _variants(mlp_mode="int8"):
          dict(HAS_RES=False, BLOCK=BD, num_warps=4)),
         (rmsnorm_fwd_kernel, (f16, f32, f32, f32, f16, f32, D, D, D, D, D, 1e-6),
          dict(HAS_RES=True, BLOCK=BD, num_warps=4)),
-        (rmsnorm_bwd_kernel, (f16, f32, f32, f32, f16, f32, D, D, D, D, D),
-         dict(HAS_DRES=False, BLOCK=BD, num_warps=4)),
+        (add_rmsnorm_bwd_kernel, (f16, f16, f32, f32, f32, f32, f16, D),
+         dict(HAS_DRES=True, WRITE_DD=True, BLOCK=BD, num_warps=4)),
+        (add_rmsnorm_bwd_kernel, (f16, f16, f32, f32, f32, f32, f16, D),
+         dict(HAS_DRES=False, WRITE_DD=True, BLOCK=BD, num_warps=4)),
         # attention
         (masked_rows_kernel, (f16, f32, f32, i64, f16, f16, D), dict(BLOCK=BD, num_warps=4)),
         (masked_rows_bwd_kernel, (f16, f16, f16, f32, f32, i64, f16, D),
@@ -128,13 +130,14 @@ def _warm_cuda():
             torch.mm(a.t(), x)
             torch.mm(a, torch.zeros(16, D, device=dev, dtype=f16))
             torch.mm(x, torch.zeros(D, 16, device=dev, dtype=f16))
-        for length in (64, 256):
-            q = torch.zeros(1, HQ, length, HD, device=dev, dtype=f16)
-            out, lse, seed, offset = torch.ops.aten._scaled_dot_product_efficient_attention(
-                q, q, q, None, True, 0.0, True, scale=HD ** -0.5)
-            torch.ops.aten._scaled_dot_product_efficient_attention_backward(
-                out, q, q, q, None, out, lse, seed, offset, 0.0, [True, True, True, False], True,
-                scale=HD ** -0.5)
+        for length in (64, 256, 1024):
+            q = torch.zeros(1, length, HQ, HD, device=dev, dtype=f16)
+            cu = torch.tensor([0, length // 2, length], device=dev, dtype=torch.int32)
+            out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+                q, q, q, None, cu, cu, length // 2, length // 2, 0.0, 1, True, scale=HD ** -0.5)
+            torch.ops.aten._efficient_attention_backward(
+                out, q, q, q, None, out, cu, cu, length // 2, length // 2, lse, 0.0, seed, offset,
+                1, False, scale=HD ** -0.5)
         h = torch.zeros(128, D, device=dev, dtype=f16)
         try:
             torch.mm(h, torch.zeros(V // 8, D, device=dev, dtype=f16).t(), out_dtype=torch.float32)

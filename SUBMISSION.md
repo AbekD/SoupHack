@@ -1,7 +1,7 @@
 # Submission: Agentic_Remaider
 
 ## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider/commit/4ca7c41c6b8e2d7d5990948acb4297229f4fd4a5
+- Repository, final commit: https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider/commit/c1bc8aff46c3854de9a52326d306a38ecbe384cd
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   our README): https://www.kaggle.com/code/abekdr/notebookd836800e9b
 - Demo video (up to 3 minutes): <VIDEO_LINK>

@@ -27,11 +27,13 @@ def _variants():
     from .attention import (masked_rows_bwd_kernel, masked_rows_kernel, rope_inverse_kernel,
                             rope_lora_kernel)
     from .fused_head import GRAD_SCALE, head_row_stats_kernel
-    from .mlp import BLOCK_I, gated_silu_rows_bwd_kernel, gated_silu_rows_kernel
+    from .mlp import (BLOCK_I, Q8_SUB, gated_silu_q8_bwd_kernel, gated_silu_q8_kernel,
+                      gated_silu_rows_bwd_kernel, gated_silu_rows_kernel)
     from .nf4 import _EXACT, nf4_unpack_kernel
     from .rmsnorm import rmsnorm_bwd_kernel, rmsnorm_fwd_kernel
 
     f16, f32, i32, i64, u8 = torch.float16, torch.float32, torch.int32, torch.int64, torch.uint8
+    i8 = torch.int8
     D, I, V, HQ, HK, HD = 1536, 8960, 151936, 12, 2, 128
     BD = 2048  # next power of two of D
     one = (1,)
@@ -55,6 +57,10 @@ def _variants():
         # MLP
         (gated_silu_rows_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
         (gated_silu_rows_bwd_kernel, (f16, f16, 2 * I, I, I), dict(BLOCK_I=BLOCK_I, num_warps=4)),
+        (gated_silu_q8_kernel, (f16, f16, i8, f32, 2 * I, I, 2 * I, 2 * (I // Q8_SUB), I),
+         dict(BLOCK_I=BLOCK_I, SUB=Q8_SUB, num_warps=4)),
+        (gated_silu_q8_bwd_kernel, (i8, f32, f16, f16, 2 * I, 2 * (I // Q8_SUB), I, 2 * I, I),
+         dict(BLOCK_I=BLOCK_I, SUB=Q8_SUB, num_warps=4)),
         # output head: labelled rows (with gradient) and the other rows (entropy only)
         (head_row_stats_kernel, (f32, V, f16, 2 * V, i64, f32, f32, f32, i32, V, GRAD_SCALE),
          dict(WRITE_GRAD=True, BLOCK=2048, num_warps=8)),

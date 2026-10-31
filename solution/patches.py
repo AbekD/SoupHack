@@ -25,7 +25,8 @@ def _knob(name, default):
     return default if value is None else value not in ("0", "false", "False", "")
 
 
-MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", False)     # keep x, recompute gate/up in the backward
+MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", False)
+MLP_INT8 = _knob("MLP_INT8", True)   # keep the MLP activations for the backward as int8 + scales     # keep x, recompute gate/up in the backward
 ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", False)
 HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "128"))  # rows per lm_head chunk
    # keep x and LoRA-A out, recompute q/k/v + SDPA
@@ -156,6 +157,10 @@ def prepare_model(model):
 
 # --------------------------------------------------------------------------- module patches
 
+def _mlp_mode():
+    return "recompute" if MLP_RECOMPUTE else ("int8" if MLP_INT8 else "fp16")
+
+
 def _stack_ok(qwen2_model):
     ok = getattr(qwen2_model, "_soup_stack_ok", None)
     if ok is None:
@@ -184,8 +189,8 @@ def _patch_causal_lm():
                             logits_to_keep=logits_to_keep, **kwargs)
         if USE_STACK and input_ids is not None and inputs_embeds is None \
                 and position_ids is None and past_key_values is None and _stack_ok(self.model):
-            y, pack = stack_forward(self.model, input_ids, attention_mask, MLP_RECOMPUTE,
-                                     ATTN_RECOMPUTE)
+            y, pack = stack_forward(self.model, input_ids, attention_mask, _mlp_mode(),
+                                    ATTN_RECOMPUTE, labels)
             if y is not None:
                 loss, tok_ent, tok_loss, hits, labelled = fused_head_loss_packed(
                     y, self.lm_head.weight, labels, pack, kwargs.get("num_items_in_batch"),
@@ -238,7 +243,7 @@ def _patch_mlp():
                            and getattr(p, "bias", None) is None for p in projs):
             return original(self, x)
         return nf4_mlp(x, self.gate_proj.weight, self.up_proj.weight, self.down_proj.weight,
-                       MLP_RECOMPUTE)
+                       _mlp_mode())
 
     modeling_qwen2.Qwen2MLP.forward = forward
 

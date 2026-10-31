@@ -82,7 +82,9 @@ def _set_rng_state(state, device):
 
 def draw_masks(pack, D, p, device):
     """The two LoRA dropout masks of one layer as the base run draws them: [B*T, D] fp32."""
-    ones = torch.ones(pack.B * pack.T, D, device=device, dtype=torch.float32)
+    ones = getattr(pack, "ones", None)
+    if ones is None or ones.shape != (pack.B * pack.T, D) or ones.device != device:
+        ones = pack.ones = torch.ones(pack.B * pack.T, D, device=device, dtype=torch.float32)
     mq = torch.nn.functional.dropout(ones, p, True)
     mv = torch.nn.functional.dropout(ones, p, True)
     return mq, mv
@@ -171,18 +173,48 @@ def rope_inverse_kernel(
 # ----------------------------------------------------------------------------- the block
 
 class PackInfo:
-    """Where each packed token sits in the padded [B, T] batch."""
+    """Where each packed token sits in the padded [B, T] batch, plus the head's row sets.
 
-    def __init__(self, attention_mask):
-        mask = attention_mask.bool()
-        self.B, self.T = mask.shape
+    Built on the CPU from one small device-to-host copy of the attention mask and the labels
+    (one sync per step instead of one per nonzero()), and sent back in one copy."""
+
+    def __init__(self, attention_mask, labels=None):
+        device = attention_mask.device
+        self.B, self.T = attention_mask.shape
+        host = attention_mask.detach()
+        if labels is not None:
+            host = torch.stack([host.to(torch.int64), labels.detach().to(torch.int64)])
+        host = host.to("cpu")
+        mask = (host[0] if labels is not None else host).bool()
         lengths = mask.sum(1)
         self.right_padded = bool(torch.equal(
-            mask, torch.arange(self.T, device=mask.device)[None, :] < lengths[:, None]))
+            mask, torch.arange(self.T)[None, :] < lengths[:, None]))
         flat = mask.reshape(-1).nonzero().squeeze(1)
-        self.dst = flat                                   # b*T + t for every packed token
-        self.pos = (flat % self.T).to(torch.int32)        # right padding: position = t
         self.N = flat.numel()
+        parts = [flat, flat % self.T]
+        self.n_lab = self.n_rest = None
+        if labels is not None:
+            # position t is scored against label t + 1 (the last position against nothing)
+            shifted = torch.nn.functional.pad(host[1], (0, 1), value=-100)[:, 1:].reshape(-1)
+            targets = shifted.index_select(0, flat)
+            labelled = targets != -100
+            lab_idx = labelled.nonzero().squeeze(1)
+            rest_idx = (~labelled).nonzero().squeeze(1)
+            self.n_lab, self.n_rest = lab_idx.numel(), rest_idx.numel()
+            parts += [targets, lab_idx, rest_idx]
+        packed = torch.cat(parts)
+        if device.type == "cuda":
+            packed = packed.pin_memory().to(device, non_blocking=True)
+        else:
+            packed = packed.to(device)
+        n = self.N
+        self.dst = packed[:n]                               # b*T + t for every packed token
+        self.pos = packed[n:2 * n].to(torch.int32)          # right padding: position = t
+        if labels is not None:
+            self.targets = packed[2 * n:3 * n]              # shifted labels of the packed rows
+            start = 3 * n
+            self.lab_idx = packed[start:start + self.n_lab]
+            self.rest_idx = packed[start + self.n_lab:]
 
 
 def dense_qkv(q_w, k_w, v_w):

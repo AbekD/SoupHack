@@ -106,6 +106,17 @@ def stack_supported(qwen2_model):
 
 
 def _layer_spec(layer, cfg, inv_freq):
+    """Per-layer constants (weights, fp16 bias, sizes), built once and cached on the layer: the
+    weights are frozen, and bitsandbytes uses the same fp16 bias values in the base run."""
+    cached = layer.__dict__.get("_soup_spec")
+    if cached is not None and cached[0]["inv_freq"] is inv_freq:
+        return dict(cached[0]), cached[1]
+    spec, params = _build_layer_spec(layer, cfg, inv_freq)
+    layer.__dict__["_soup_spec"] = (spec, params)
+    return dict(spec), params
+
+
+def _build_layer_spec(layer, cfg, inv_freq):
     att = layer.self_attn
     qb, aq, bq, p, scaling = _lora_parts(att.q_proj)
     vb, av, bv, _, _ = _lora_parts(att.v_proj)
@@ -120,20 +131,23 @@ def _layer_spec(layer, cfg, inv_freq):
     return spec, (aq, bq, av, bv)
 
 
-def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False,
-                  attn_recompute=False):
+def stack_forward(qwen2_model, input_ids, attention_mask, mlp_mode="fp16",
+                  attn_recompute=False, labels=None):
     """Final-norm hidden states [N, D] fp16 of the real tokens, and the PackInfo."""
     cfg = qwen2_model.config
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
-    pack = PackInfo(attention_mask)
+    pack = PackInfo(attention_mask, labels)
     if not pack.right_padded:
         return None, None
     ids = input_ids.reshape(-1).index_select(0, pack.dst)
     h = qwen2_model.embed_tokens(ids)                       # [N, D] fp32 (our fp16->fp32 lookup)
     if h.dtype != torch.float32:
         h = h.float()
-    inv_freq = qwen2_model.rotary_emb.inv_freq.float().contiguous()
+    inv_freq = qwen2_model.__dict__.get("_soup_inv_freq")
+    if inv_freq is None:
+        inv_freq = qwen2_model.rotary_emb.inv_freq.float().contiguous()
+        qwen2_model.__dict__["_soup_inv_freq"] = inv_freq
     delta = None
     eps = cfg.rms_norm_eps
     for layer in qwen2_model.layers:
@@ -146,6 +160,6 @@ def stack_forward(qwen2_model, input_ids, attention_mask, mlp_recompute=False,
         h, y = AddRMSNorm.apply(h, attn, layer.post_attention_layernorm.weight, eps)
         mlp = layer.mlp
         delta = NF4MLP.apply(y, mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight,
-                             mlp_recompute)
+                             mlp_mode)
     h, y = AddRMSNorm.apply(h, delta, qwen2_model.norm.weight, eps)
     return y, pack

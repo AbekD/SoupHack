@@ -153,17 +153,20 @@ def _mm(a, b):
 
 class FusedHeadLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight16, targets, active, denominator, chunk):
+    def forward(ctx, hidden, weight16, targets, active, denominator, chunk, rows=None):
         # hidden [B, T, D] (any float dtype), weight16 [V, D] fp16, targets [B, T] int64 (already
         # shifted: position t is scored against token t+1), active [B, T] bool (rows needing the
         # entropy), denominator: a python float or 0-d tensor
         B, T, D = hidden.shape
         flat_h = hidden.reshape(-1, D)
         flat_t = targets.reshape(-1)
-        labelled = flat_t != IGNORE_INDEX
-        need = active.reshape(-1) | labelled
-        lab_idx = labelled.nonzero().squeeze(1)
-        rest_idx = (need & ~labelled).nonzero().squeeze(1)
+        if rows is None:
+            labelled = flat_t != IGNORE_INDEX
+            need = active.reshape(-1) | labelled
+            lab_idx = labelled.nonzero().squeeze(1)
+            rest_idx = (need & ~labelled).nonzero().squeeze(1)
+        else:   # (labelled rows, other rows) already known: no device sync here
+            lab_idx, rest_idx = rows
         n_lab = lab_idx.numel()
 
         dev = hidden.device
@@ -205,7 +208,7 @@ class FusedHeadLoss(torch.autograd.Function):
         if dh is not None and dh.numel():
             factor = grad_loss.float() / (ctx.denominator * GRAD_SCALE)
             grad.index_copy_(0, lab_idx, dh * factor)
-        return grad.view(B, T, D).to(ctx.dtype), None, None, None, None, None
+        return grad.view(B, T, D).to(ctx.dtype), None, None, None, None, None, None
 
 
 def shift_labels(labels):
@@ -238,10 +241,11 @@ def fused_head_loss(hidden, weight16, labels, attention_mask=None, num_items_in_
 def fused_head_loss_packed(hidden, weight16, labels, pack, num_items_in_batch=None,
                            chunk=DEFAULT_CHUNK):
     """The same on pad-free tokens: hidden [N, D] holds the rows `pack.dst` of the padded
-    [B, T] batch. Per-token results come back in the padded [B, T] layout (zeros at pads)."""
+    [B, T] batch (pack built with the labels). Per-token results come back in the padded [B, T]
+    layout (zeros at pads)."""
     B, T = labels.shape
-    targets = shift_labels(labels).to(hidden.device).reshape(-1).index_select(0, pack.dst)
-    n_labelled = (targets != IGNORE_INDEX).sum()
+    targets = pack.targets
+    n_labelled = torch.tensor(pack.n_lab, device=hidden.device)
     if num_items_in_batch is None:
         denominator = n_labelled
     elif torch.is_tensor(num_items_in_batch):
@@ -251,7 +255,8 @@ def fused_head_loss_packed(hidden, weight16, labels, pack, num_items_in_batch=No
     n = hidden.shape[0]
     active = torch.ones(1, n, dtype=torch.bool, device=hidden.device)
     loss, ent_p, loss_p, hits = FusedHeadLoss.apply(
-        hidden.unsqueeze(0), weight16, targets.unsqueeze(0), active, denominator, chunk)
+        hidden.unsqueeze(0), weight16, targets.unsqueeze(0), active, denominator, chunk,
+        (pack.lab_idx, pack.rest_idx))
     tok_ent = torch.zeros(B * T, device=hidden.device, dtype=torch.float32)
     tok_loss = torch.zeros(B * T, device=hidden.device, dtype=torch.float32)
     tok_ent.index_copy_(0, pack.dst, ent_p.reshape(-1))

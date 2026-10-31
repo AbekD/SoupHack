@@ -73,18 +73,84 @@ def _variants(mlp_mode="int8"):
     ], one
 
 
-def _run():
+THREADS = 2   # Kaggle gives 4 CPU cores; compilation is mostly outside the GIL
+
+
+def _compile(variants, grid):
     try:
         torch.cuda.set_device(0)
-        from .patches import _mlp_mode
-        variants, grid = _variants(_mlp_mode())
-    except Exception:  # noqa: BLE001 - warming up is an optimisation, never a failure
+    except Exception:  # noqa: BLE001
         return
     for kernel, args, kwargs in variants:
         try:
             kernel.warmup(*args, grid=grid, **kwargs)
+        except Exception:  # noqa: BLE001 - warming up is an optimisation, never a failure
+            pass
+
+
+def _warm_cuda():
+    """Load the cuBLAS / attention kernels the step uses (CUDA loads kernels lazily, at first
+    launch) and create the cuBLAS handle, by running the step's matmul and attention shapes once
+    on small inputs. Nothing here draws random numbers, so the CUDA RNG stream (the LoRA dropout
+    masks) is untouched; the buffers are freed when this returns."""
+    D, QKV, I, V, HQ, HD = 1536, 2048, 8960, 151936, 12, 128
+    dev = torch.device("cuda", 0)
+    f16 = torch.float16
+    with torch.no_grad():
+        w_qkv = torch.zeros(QKV, D, device=dev, dtype=f16)
+        w_gu = torch.zeros(2 * I, D, device=dev, dtype=f16)
+        w_d = torch.zeros(D, I, device=dev, dtype=f16)
+        w_o = torch.zeros(D, HQ * HD, device=dev, dtype=f16)
+        bias = torch.zeros(QKV, device=dev, dtype=f16)
+        for m in (128, 512, 1024):
+            x = torch.zeros(m, D, device=dev, dtype=f16)
+            torch.addmm(bias, x, w_qkv.t())
+            gu = torch.mm(x, w_gu.t())
+            torch.mm(gu[:, :I], w_d.t())
+            torch.mm(x, w_o.t())
+            torch.mm(x, w_d)                    # backward shapes
+            torch.mm(gu, w_gu)
+            dqkv = torch.zeros(m, QKV, device=dev, dtype=f16)
+            torch.mm(dqkv, w_qkv)
+            a = torch.zeros(m, 16, device=dev, dtype=f16)
+            torch.mm(dqkv[:, :HQ * HD].t(), a)
+            torch.mm(a.t(), x)
+            torch.mm(a, torch.zeros(16, D, device=dev, dtype=f16))
+            torch.mm(x, torch.zeros(D, 16, device=dev, dtype=f16))
+        for length in (64, 256):
+            q = torch.zeros(1, HQ, length, HD, device=dev, dtype=f16)
+            out, lse, seed, offset = torch.ops.aten._scaled_dot_product_efficient_attention(
+                q, q, q, None, True, 0.0, True, scale=HD ** -0.5)
+            torch.ops.aten._scaled_dot_product_efficient_attention_backward(
+                out, q, q, q, None, out, lse, seed, offset, 0.0, [True, True, True, False], True,
+                scale=HD ** -0.5)
+        h = torch.zeros(128, D, device=dev, dtype=f16)
+        try:
+            torch.mm(h, torch.zeros(V // 8, D, device=dev, dtype=f16).t(), out_dtype=torch.float32)
         except Exception:  # noqa: BLE001
             pass
+    torch.cuda.synchronize(dev)
+
+
+def _run():
+    try:
+        from .patches import _mlp_mode
+        variants, grid = _variants(_mlp_mode())
+    except Exception:  # noqa: BLE001
+        return
+    # the slowest compiles first, spread over the threads
+    threads = [threading.Thread(target=_compile, args=(variants[i::THREADS], grid),
+                                name=f"soup-kernels-warmup-{i}", daemon=False)
+               for i in range(1, THREADS)]
+    for thread in threads:
+        thread.start()
+    _compile(variants[0::THREADS], grid)
+    try:
+        _warm_cuda()
+    except Exception:  # noqa: BLE001
+        pass
+    for thread in threads:
+        thread.join()
 
 
 def start():

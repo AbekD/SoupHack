@@ -30,7 +30,8 @@ MLP_INT8 = _knob("MLP_INT8", True)   # keep the MLP activations for the backward
 ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", False)
 HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "128"))  # rows per lm_head chunk
    # keep x and LoRA-A out, recompute q/k/v + SDPA
-WARMUP = _knob("WARMUP", True)       # compile our kernels in a thread while the model loads
+WARMUP = _knob("WARMUP", True)
+FAST_STARTUP = _knob("FAST_STARTUP", True)  # see solution/startup.py       # compile our kernels in a thread while the model loads
 USE_STACK = _knob("USE_STACK", True)    # our own pad-free decoder stack (attention + MLP + norms)
 ALLOW_CPU = False  # only for our CPU tests under TRITON_INTERPRET=1
 
@@ -542,6 +543,14 @@ def _patch_memlog():
 
 
 def apply_all():
+    # first: compile our kernels in the background for the whole of Soup's start-up
+    if WARMUP:
+        from .warmup import start
+        start()
+    from .startup import patch_datasets_tokenizer_fingerprint, patch_packages_distributions
+    if FAST_STARTUP:
+        patch_packages_distributions()          # before anything imports trl
+        patch_datasets_tokenizer_fingerprint()
     _start_cprofile()
     _patch_timelog()
     _patch_memlog()
@@ -551,6 +560,3 @@ def apply_all():
     _patch_mlp()
     _patch_trl_compute_loss()
     _patch_soup_setup()
-    if WARMUP:
-        from .warmup import start
-        start()

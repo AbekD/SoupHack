@@ -245,7 +245,7 @@ def fused_head_loss_packed(hidden, weight16, labels, pack, num_items_in_batch=No
     layout (zeros at pads)."""
     B, T = labels.shape
     targets = pack.targets
-    n_labelled = torch.tensor(pack.n_lab, device=hidden.device)
+    n_labelled = (targets != IGNORE_INDEX).sum()     # on the GPU: no host round trip
     if num_items_in_batch is None:
         denominator = n_labelled
     elif torch.is_tensor(num_items_in_batch):

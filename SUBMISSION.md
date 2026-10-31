@@ -5,7 +5,7 @@
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   our README): https://www.kaggle.com/code/abekdr/notebookd836800e9b
 - Demo video (up to 3 minutes): <VIDEO_LINK>
-- Presentation: <SLIDES_LINK>
+- Presentation: https://github.com/BAITC-Hacks/hack-5f644d36-agentic-remaider/blob/main/docs/presentation.pdf
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |

@@ -1,7 +1,7 @@
 # Soup Kernel Challenge — our solution
 
 `soup train` (Soup 0.77.0, Qwen2.5-1.5B-Instruct, NF4 4-bit, LoRA r=16 on q/v, batch 4, 512
-tokens, 64 steps) on a free Kaggle T4: **1.7× faster and 5.1× less GPU memory**, same task, same
+tokens, 64 steps) on a free Kaggle T4: **1.8× faster and 5.2× less GPU memory**, same task, same
 adapter, same Soup outputs. Our own Triton kernels, a hand-written forward/backward of the decoder
 stack on pad-free tokens, and a few start-up fixes found by profiling the whole run.
 
@@ -16,14 +16,14 @@ medians of two runs each) and `harness/check_rules.py`. Run to run, our time var
 
 | | Base Soup 0.77.0 | Ours | Ratio |
 |---|---|---|---|
-| Whole `soup train`, s | 82.1 | 49.1 | speedup **1.67×** |
-| Peak GPU memory (nvidia-smi), MiB | 14 345 | 2 795 | base/ours **5.13×** |
-| Eval loss, public rows 40000–40255 | 2.04972 | 2.04964 | −0.004 % |
-| Our kernels' share of training time (check 4) | — | 18.1 % | needs ≥ 5 % |
+| Whole `soup train`, s | 78.4 | 43.6 | speedup **1.80×** |
+| Peak GPU memory (nvidia-smi), MiB | 14 345 | 2 775 | base/ours **5.17×** |
+| Eval loss, public rows 40000–40255 | 2.04962 | 2.04967 | +0.002 % |
+| Our kernels' share of training time (check 4) | — | 19.3 % | needs ≥ 5 % |
 
 All 10 checks pass: loss curve within 0.02 % of the base on the first step and 0.01 % on average;
 entropy, token accuracy and every `rewind.jsonl` row loss within tolerance; eval loss equal to the
-base (±0.001 %); 79/79 Soup regression tests with our patches.
+base (+0.002 %); 79/79 Soup regression tests with our patches.
 
 ### How we got there
 Each row is a full notebook run on a T4 (base re-measured in the same session, 75–82 s, 14 345 MiB):
@@ -38,7 +38,8 @@ Each row is a full notebook run on a T4 (base re-measured in the same session, 7
 | v8 | start-up: faster `datasets` tokenizer fingerprint and trl metadata scan | 47.3 | 2 833 |
 | v9 | Triton launchers built + kernel binaries loaded in the background thread | 44.7 | 2 833 |
 | v10 | one variable-length attention call per layer; fused add+RMSNorm backward | 44.2 | 2 795 |
-| v10, `--repeats 2` | final run (table above) | **49.1** (base 82.1) | **2 795** |
+| v10, `--repeats 2` | (base 82.1 in that session) | 49.1 | 2 795 |
+| v11, `--repeats 2` | no unused optional imports, GPU-side bf16→fp16 load, trainable-only `zero_grad` — final (table above) | **43.6** (base 78.4) | **2 775** |
 
 Things we measured and did **not** keep: recomputing MLP activations (−1.4 GB but +13 % time) and
 attention activations (−340 MB, +8 % time) — at our operating point speed points cost more than
@@ -133,8 +134,17 @@ backwards keep only what they need:
   use it, and a different tokenizer still gives a different fingerprint. −3.5 s.
 * **trl's import-time `importlib.metadata.packages_distributions()`** is computed with plain
   string operations; we checked the result is identical to the standard library's.
+* **Optional imports nothing here uses** (`wandb`, which trl imports when installed though Soup's
+  `report_to` is `none`; `sklearn`, for transformers' assisted generation) are reported
+  unavailable to those checks, saving their import time.
+* **bf16 → fp16 conversion of the checkpoint on the GPU** instead of the CPU while loading (same
+  IEEE rounding, bit-identical weights).
 * **Fewer host syncs and tiny ops per step:** the packing and the head's row sets come from one
-  device-to-host copy per step; per-layer constants and fp16 LoRA copies are made once.
+  device-to-host copy per step; per-layer constants and fp16 LoRA copies are made once;
+  `model.zero_grad()` clears only the trainable LoRA tensors (same `set_to_none` behaviour; falls
+  back to the full walk if any frozen parameter ever holds a gradient).
+* The last three ideas (optional imports, GPU-side dtype conversion, trainable-only `zero_grad`)
+  came up in discussion with other participants during the hackathon.
 
 ### Kernel list
 | Kernel | File | Replaces |

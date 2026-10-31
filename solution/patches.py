@@ -133,6 +133,39 @@ def _fp16_embedding(causal_lm):
     return weight
 
 
+def _fast_zero_grad(model):
+    """HF's training loop calls model.zero_grad() every step; nn.Module.zero_grad walks every
+    module and parameter of the 4-bit model (thousands) to find the few hundred LoRA tensors that
+    have gradients. Only trainable parameters can hold a gradient here, so we clear exactly those,
+    with the same set_to_none semantics. The list is taken once; if any other parameter ever holds
+    a gradient (or becomes trainable), it falls back to the full walk."""
+    original = model.zero_grad
+    state = {"trainable": None}
+
+    def zero_grad(self, set_to_none=True):
+        if state["trainable"] is None:
+            # built at the first call (HF calls it once before the loop, after every dtype cast
+            # of the LoRA weights), and only if no frozen parameter holds a gradient
+            params = list(self.parameters())
+            trainable = [p for p in params if p.requires_grad]
+            if any(p.grad is not None for p in params if not p.requires_grad):
+                return original(set_to_none)
+            state["trainable"] = trainable
+        for p in state["trainable"]:
+            if p.grad is None:
+                continue
+            if set_to_none:
+                p.grad = None
+            else:
+                if p.grad.grad_fn is not None:
+                    p.grad.detach_()
+                else:
+                    p.grad.requires_grad_(False)
+                p.grad.zero_()
+
+    model.zero_grad = types.MethodType(zero_grad, model)
+
+
 def prepare_model(model):
     """Called once the final 4-bit PEFT model exists (after Soup's _setup_transformers)."""
     if not isinstance(model, torch.nn.Module):
@@ -154,6 +187,8 @@ def prepare_model(model):
         return
     for module in causal_lm.modules():
         setattr(module, _ENABLED_ATTR, True)
+    if FAST_STARTUP:
+        _fast_zero_grad(model)
 
 
 # --------------------------------------------------------------------------- module patches
@@ -550,10 +585,13 @@ def apply_all():
     if WARMUP:
         from .warmup import start
         start()
-    from .startup import patch_datasets_tokenizer_fingerprint, patch_packages_distributions
+    from .startup import (patch_datasets_tokenizer_fingerprint, patch_gpu_dtype_conversion,
+                          patch_optional_imports, patch_packages_distributions)
     if FAST_STARTUP:
         patch_packages_distributions()          # before anything imports trl
+        patch_optional_imports()
         patch_datasets_tokenizer_fingerprint()
+        patch_gpu_dtype_conversion()
     _start_cprofile()
     _patch_timelog()
     _patch_memlog()

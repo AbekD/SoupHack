@@ -112,3 +112,70 @@ def patch_datasets_tokenizer_fingerprint():
         for key, value in list(dispatch.items()):
             if value is original:
                 dispatch[key] = _save_tokenizer
+
+
+def patch_optional_imports():
+    """3. Optional packages nothing in this run uses, imported at start-up only because they are
+    installed on Kaggle's image: `wandb` (trl's trainer modules import it when
+    `is_wandb_available()`; Soup's `report_to` is "none", so it is never used) and `sklearn`
+    (transformers' assisted-generation module imports `roc_curve` from it). Both cost about a
+    second to import. We report them unavailable to those checks, before the modules load."""
+    import sys
+
+    def unavailable(*_args, **_kwargs):
+        return False
+
+    # sklearn first: importing transformers' integrations (below) loads the generation modules
+    if "transformers.generation.candidate_generator" not in sys.modules \
+            and "sklearn" not in sys.modules:
+        try:
+            import transformers.utils as transformers_utils
+            import transformers.utils.import_utils as import_utils
+            transformers_utils.is_sklearn_available = unavailable
+            import_utils.is_sklearn_available = unavailable
+        except Exception:  # noqa: BLE001
+            pass
+    if "wandb" not in sys.modules:
+        try:
+            import transformers
+            import transformers.integrations.integration_utils as integration_utils
+            integration_utils.is_wandb_available = unavailable
+            transformers.is_wandb_available = unavailable
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import accelerate.utils as accelerate_utils
+            import accelerate.utils.imports as accelerate_imports
+            accelerate_utils.is_wandb_available = unavailable
+            accelerate_imports.is_wandb_available = unavailable
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def patch_gpu_dtype_conversion():
+    """4. The checkpoint is bf16 and Soup loads the model in fp16: transformers converts each
+    tensor on the CPU and then copies it (`core_model_loading._materialize_copy`). We copy the
+    bf16 bytes to the GPU and convert there; the conversion is the same IEEE rounding, so the
+    loaded weights are bit-identical."""
+    try:
+        import transformers.core_model_loading as loading
+    except Exception:  # noqa: BLE001
+        return
+    original = getattr(loading, "_materialize_copy", None)
+    if original is None:
+        return
+    import torch
+
+    def _materialize_copy(tensor, device=None, dtype=None):
+        tensor = tensor[...]
+        target = torch.device(device) if device is not None and not isinstance(device, int) \
+            else (torch.device("cuda", device) if isinstance(device, int) else None)
+        if target is not None and target.type == "cuda" and dtype is not None \
+                and tensor.device.type == "cpu" and tensor.dtype != dtype \
+                and tensor.dtype.is_floating_point and dtype.is_floating_point:
+            return tensor.to(device=target).to(dtype=dtype)
+        if dtype is not None or device is not None:
+            tensor = tensor.to(device=device, dtype=dtype)
+        return tensor
+
+    loading._materialize_copy = _materialize_copy

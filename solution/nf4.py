@@ -27,52 +27,65 @@ _INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 _EXACT = _libdevice is not None and not _INTERPRET
 
 
-@triton.jit
-def _mul_rn(a, b, EXACT: tl.constexpr):
-    if EXACT:
-        return _libdevice.mul_rn(a, b)
-    else:
-        return a * b
-
-
-@triton.jit
+@triton.jit(do_not_specialize=["n_words"])
 def nf4_unpack_kernel(
-    packed_ptr,        # uint8 [n_values // 2]
+    packed_ptr,        # int32 view of the packed codes: 4 bytes = 8 values per word
     absmax_ptr,        # uint8 [n_blocks] (double quant) or fp32 [n_blocks]
     absmax2_ptr,       # fp32 [n_blocks // NESTED_BLOCK] (double quant only)
     code2_ptr,         # fp32 [256] (double quant only)
     code_ptr,          # fp32 [16], the NF4 levels
-    out_ptr,           # fp16 [n_values]
+    out_ptr,           # int32 view of the fp16 output: 2 values per word
     offset,            # fp32 (double quant only)
-    n_values,
+    n_words,
     BLOCKSIZE: tl.constexpr,      # values per absmax (64)
     NESTED_BLOCK: tl.constexpr,   # absmax values per nested scale (256)
     NESTED: tl.constexpr,
     EXACT: tl.constexpr,
-    BYTES: tl.constexpr,          # bytes handled by one program
+    WORDS: tl.constexpr,          # packed words handled by one program
 ):
     pid = tl.program_id(0).to(tl.int64)
-    byte = pid * BYTES + tl.arange(0, BYTES)
-    in_range = byte * 2 < n_values
-    packed = tl.load(packed_ptr + byte, mask=in_range, other=0).to(tl.int32)
-    block = (2 * byte) // BLOCKSIZE        # both nibbles of a byte share a block (BLOCKSIZE even)
+    w = pid * WORDS + tl.arange(0, WORDS)
+    in_range = w < n_words
+    word = tl.load(packed_ptr + w, mask=in_range, other=0)
+    block = (8 * w) // BLOCKSIZE           # the 8 values of a word share a block (BLOCKSIZE % 8 == 0)
     if NESTED:
         # bitsandbytes: absmax = dequantize_blockwise(...) (an fp32 product, stored), then
         # absmax += offset (a separate add). Two roundings, never an FMA.
         q = tl.load(absmax_ptr + block, mask=in_range, other=0).to(tl.int32)
         scale2 = tl.load(absmax2_ptr + block // NESTED_BLOCK, mask=in_range, other=0.0)
-        absmax = _mul_rn(tl.load(code2_ptr + q), scale2, EXACT) + offset
+        code2 = tl.load(code2_ptr + q)
+        if EXACT:
+            absmax = _libdevice.mul_rn(code2, scale2) + offset
+        else:
+            absmax = code2 * scale2 + offset
     else:
         absmax = tl.load(absmax_ptr + block, mask=in_range, other=0.0).to(tl.float32)
-    hi = (tl.load(code_ptr + (packed >> 4)) * absmax).to(tl.float16)
-    lo = (tl.load(code_ptr + (packed & 15)) * absmax).to(tl.float16)
-    # the two fp16 values of a byte as one 32-bit word (little endian: hi first), so each lane
-    # writes 4 contiguous bytes and the stores vectorise
-    hi_bits = hi.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
-    lo_bits = lo.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
-    word = hi_bits | (lo_bits << 16)
-    out32 = out_ptr.to(tl.pointer_type(tl.int32))
-    tl.store(out32 + byte, word, mask=in_range)
+    # byte k of the word holds values 2k (high nibble) and 2k+1 (low nibble); each pair of
+    # fp16 results becomes one little-endian 32-bit word
+    b0 = (word >> 0) & 0xFF
+    h0 = (tl.load(code_ptr + (b0 >> 4)) * absmax).to(tl.float16)
+    l0 = (tl.load(code_ptr + (b0 & 15)) * absmax).to(tl.float16)
+    o0 = (h0.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | \
+        ((l0.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16)
+    b1 = (word >> 8) & 0xFF
+    h1 = (tl.load(code_ptr + (b1 >> 4)) * absmax).to(tl.float16)
+    l1 = (tl.load(code_ptr + (b1 & 15)) * absmax).to(tl.float16)
+    o1 = (h1.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | \
+        ((l1.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16)
+    b2 = (word >> 16) & 0xFF
+    h2 = (tl.load(code_ptr + (b2 >> 4)) * absmax).to(tl.float16)
+    l2 = (tl.load(code_ptr + (b2 & 15)) * absmax).to(tl.float16)
+    o2 = (h2.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | \
+        ((l2.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16)
+    b3 = (word >> 24) & 0xFF
+    h3 = (tl.load(code_ptr + (b3 >> 4)) * absmax).to(tl.float16)
+    l3 = (tl.load(code_ptr + (b3 & 15)) * absmax).to(tl.float16)
+    o3 = (h3.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) | \
+        ((l3.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16)
+    # [o0, o1, o2, o3] per word: 16 contiguous output bytes per lane
+    vals = tl.reshape(tl.join(tl.join(o0, o2), tl.join(o1, o3)), [WORDS, 4])
+    offs = w[:, None] * 4 + tl.arange(0, 4)[None, :]
+    tl.store(out_ptr + offs, vals, mask=in_range[:, None])
 
 
 _STATE_CACHE = {}
@@ -120,12 +133,13 @@ def unpack_nf4(weight, out=None):
     if out is None:
         out = torch.empty(st["shape"], device=weight.device, dtype=torch.float16)
     assert out.is_contiguous() and out.numel() == n and out.dtype == torch.float16
-    assert n % 2 == 0 and out.data_ptr() % 4 == 0
-    bytes_per_prog = 2048
-    grid = (triton.cdiv((n + 1) // 2, bytes_per_prog),)
+    assert n % 8 == 0 and out.data_ptr() % 16 == 0 and st["packed"].data_ptr() % 4 == 0
+    n_words = n // 8
+    words_per_prog = 512
+    grid = (triton.cdiv(n_words, words_per_prog),)
     nf4_unpack_kernel[grid](
-        st["packed"], st["absmax"], st["absmax2"], st["code2"], st["code"], out,
-        st["offset"], n,
+        st["packed"].view(torch.int32), st["absmax"], st["absmax2"], st["code2"], st["code"],
+        out.view(-1).view(torch.int32), st["offset"], n_words,
         BLOCKSIZE=st["blocksize"], NESTED_BLOCK=st["nested_block"], NESTED=st["nested"],
-        EXACT=_EXACT, BYTES=bytes_per_prog, num_warps=4)
+        EXACT=_EXACT, WORDS=words_per_prog, num_warps=4)
     return out

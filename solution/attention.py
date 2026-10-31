@@ -110,7 +110,7 @@ def masked_rows_bwd(base, gq, gv, mq, mv, pack, out_dtype):
 
 # ----------------------------------------------------------------------------- RoPE + (un)pack
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def rope_pack_kernel(
     qkv_ptr, lq_ptr, lv_ptr,          # [N, QD + 2 KD] fp16, [N, QD] fp16, [N, KD] fp16
     pos_ptr, dst_ptr, inv_freq_ptr,   # [N] int32 position, [N] int64 b*T + t, [HALF] fp32
@@ -156,7 +156,7 @@ def rope_pack_kernel(
         tl.store(out + HALF + j, v2.to(tl.float16))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def rope_unpack_bwd_kernel(
     dq_ptr, dk_ptr, dv_ptr,           # [B, HQ, T, HD], [B, HQ, T, HD] (per q head), [B, HQ, T, HD]
     pos_ptr, dst_ptr, inv_freq_ptr,
@@ -205,7 +205,7 @@ def rope_unpack_bwd_kernel(
         tl.store(row + QD + KD + hk * HD + HALF + j, w2.to(tl.float16))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def gather_rows_kernel(src_ptr, dst_idx_ptr, out_ptr, T, H: tl.constexpr, HD: tl.constexpr):
     # out[tok, h*HD + d] = src[b, h, t, d]  (attention output back to packed [N, H*HD])
     tok = tl.program_id(0).to(tl.int64)
@@ -218,7 +218,7 @@ def gather_rows_kernel(src_ptr, dst_idx_ptr, out_ptr, T, H: tl.constexpr, HD: tl
     tl.store(out_ptr + tok * (H * HD) + h * HD + d, x)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def scatter_rows_kernel(src_ptr, dst_idx_ptr, out_ptr, T, H: tl.constexpr, HD: tl.constexpr):
     # out[b, h, t, d] = src[tok, h*HD + d]  (its transpose; pads stay zero)
     tok = tl.program_id(0).to(tl.int64)

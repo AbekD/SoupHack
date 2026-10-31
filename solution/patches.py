@@ -25,8 +25,8 @@ def _knob(name, default):
     return default if value is None else value not in ("0", "false", "False", "")
 
 
-MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", True)     # keep x, recompute gate/up in the backward
-ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", True)
+MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", False)     # keep x, recompute gate/up in the backward
+ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", False)
 HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "256"))  # rows per lm_head chunk
    # keep x and LoRA-A out, recompute q/k/v + SDPA
 USE_STACK = _knob("USE_STACK", True)    # our own pad-free decoder stack (attention + MLP + norms)
@@ -47,19 +47,80 @@ def _is_ours(module):
 
 # --------------------------------------------------------------------------- model preparation
 
+def _tied_qwen2_embedding(model):
+    """(embedding module, lm_head module) of a CUDA 4-bit Qwen2ForCausalLM whose head is tied to
+    its embedding, else None."""
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(model, Qwen2ForCausalLM) or not getattr(model, "is_loaded_in_4bit", False):
+        return None
+    emb, head = model.get_input_embeddings(), model.get_output_embeddings()
+    if emb is None or head is None or head.weight is not emb.weight \
+            or not _on_gpu(emb.weight) or getattr(head, "bias", None) is not None:
+        return None
+    return emb, head
+
+
+def _patch_kbit_prep():
+    """prepare_model_for_kbit_training upcasts every non-4-bit parameter to fp32, the tied
+    151,936 x 1,536 embedding / lm_head included: the fp16 copy and the fp32 copy (466 + 933 MB)
+    are both alive while it runs, and the fp32 copy stays for the whole run. The embedding is
+    frozen and its values are the fp16 checkpoint values, so the fp32 copy holds nothing more.
+    We keep it in fp16 (it is set aside while the original runs and put back afterwards) and our
+    embedding lookup returns fp32 rows, exactly what the base run reads."""
+    import peft
+    import peft.utils.other as peft_other
+
+    original = peft_other.prepare_model_for_kbit_training
+
+    def prepare_model_for_kbit_training(model, *args, **kwargs):
+        tied = _tied_qwen2_embedding(model)
+        if tied is None or tied[0].weight.dtype != torch.float16:
+            return original(model, *args, **kwargs)
+        emb, head = tied
+        weight = emb.weight
+        stand_in = torch.nn.Parameter(torch.empty(0, device=weight.device, dtype=torch.float32),
+                                      requires_grad=False)
+        emb.weight = stand_in
+        head.weight = stand_in
+        try:
+            result = original(model, *args, **kwargs)
+        finally:
+            weight.requires_grad_(False)
+            emb.weight = weight
+            head.weight = weight
+        return result
+
+    peft_other.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+    peft.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+    try:
+        import peft.utils as peft_utils
+        peft_utils.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _fp16_embedding(causal_lm):
-    """The tied embedding / lm_head is kept in fp32 by prepare_model_for_kbit_training, but its
-    values come from the fp16 checkpoint load, so an fp16 copy is exact. Store it in fp16 (half
-    the memory) and give the embedding lookup back in fp32, as the base run does; the head reads
-    the fp16 weight directly (tensor cores)."""
+    """Make the tied embedding fp16 in storage and fp32 at lookup (see _patch_kbit_prep). If the
+    weight is fp32 here (our prep patch did not run), convert it only when the fp16 copy is
+    exact, checking and copying in slices so no second full-size copy is ever alive."""
     emb = causal_lm.get_input_embeddings()
     weight = emb.weight
-    if weight.dtype != torch.float32 or weight.requires_grad:
+    if weight.requires_grad:
         return None
-    half = weight.detach().to(torch.float16)
-    if not torch.equal(half.float(), weight.detach()):
-        return None  # not exactly representable: keep the base path
-    weight.data = half
+    if weight.dtype == torch.float32:
+        half = torch.empty(weight.shape, device=weight.device, dtype=torch.float16)
+        step = 8192
+        for start in range(0, weight.shape[0], step):
+            part = weight.data[start:start + step]
+            half[start:start + step] = part
+            if not torch.equal(half[start:start + step].float(), part):
+                return None  # not exactly representable: keep the base path
+        weight.data = half
+    elif weight.dtype != torch.float16:
+        return None
     padding_idx = emb.padding_idx
 
     def forward(self, input_ids):
@@ -302,7 +363,46 @@ def _patch_soup_setup():
     sft.SFTTrainerWrapper._setup_transformers = _setup_transformers
 
 
+def _patch_memlog():
+    """Development only (SOUP_KERNELS_MEMLOG=1): print where the GPU memory peak happens."""
+    if _os.environ.get("SOUP_KERNELS_MEMLOG") != "1":
+        return
+    import trl
+    from soup_cli.trainer import sft
+
+    def mib(x):
+        return round(x / 2**20)
+
+    setup = sft.SFTTrainerWrapper._setup_transformers
+
+    def _setup_transformers(self, *args, **kwargs):
+        torch.cuda.reset_peak_memory_stats()
+        result = setup(self, *args, **kwargs)
+        print(f"[memlog] setup: peak alloc {mib(torch.cuda.max_memory_allocated())} MiB, "
+              f"peak reserved {mib(torch.cuda.max_memory_reserved())} MiB, now alloc "
+              f"{mib(torch.cuda.memory_allocated())} MiB", flush=True)
+        return result
+
+    sft.SFTTrainerWrapper._setup_transformers = _setup_transformers
+    step = trl.SFTTrainer.training_step
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        out = step(self, model, inputs, *args, **kwargs)
+        tokens = int(inputs["attention_mask"].sum()) if "attention_mask" in inputs else -1
+        print(f"[memlog] step {self.state.global_step + 1}: tokens {tokens} x "
+              f"{inputs['input_ids'].shape[1]} padded, before {mib(before)} MiB, peak alloc "
+              f"{mib(torch.cuda.max_memory_allocated())} MiB, peak reserved "
+              f"{mib(torch.cuda.max_memory_reserved())} MiB", flush=True)
+        return out
+
+    trl.SFTTrainer.training_step = training_step
+
+
 def apply_all():
+    _patch_memlog()
+    _patch_kbit_prep()
     _patch_causal_lm()
     _patch_rmsnorm()
     _patch_mlp()

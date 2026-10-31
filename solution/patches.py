@@ -364,6 +364,92 @@ def _patch_soup_setup():
     sft.SFTTrainerWrapper._setup_transformers = _setup_transformers
 
 
+def _since_start():
+    """Seconds since this process started (Linux /proc), for the development timeline."""
+    import time
+    try:
+        with open("/proc/self/stat") as handle:
+            start_ticks = int(handle.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as handle:
+            uptime = float(handle.read().split()[0])
+        return round(uptime - start_ticks / _os.sysconf("SC_CLK_TCK"), 2)
+    except Exception:  # noqa: BLE001
+        return round(time.monotonic(), 2)
+
+
+def _patch_timelog():
+    """Development only (SOUP_KERNELS_TIMELOG=1): print a timeline of the run (process start = 0)."""
+    if _os.environ.get("SOUP_KERNELS_TIMELOG") != "1":
+        return
+    import trl
+    import transformers
+    from soup_cli.trainer import sft
+
+    def mark(what):
+        print(f"[timelog] {_since_start():7.2f}s  {what}", flush=True)
+
+    mark("apply()")
+    setup = sft.SFTTrainerWrapper._setup_transformers
+
+    def _setup_transformers(self, *args, **kwargs):
+        mark("model setup begins")
+        result = setup(self, *args, **kwargs)
+        mark("model setup done (loaded, quantised, LoRA)")
+        return result
+
+    sft.SFTTrainerWrapper._setup_transformers = _setup_transformers
+    load = transformers.AutoModelForCausalLM.from_pretrained.__func__
+
+    def from_pretrained(cls, *args, **kwargs):
+        mark("from_pretrained begins")
+        model = load(cls, *args, **kwargs)
+        mark("from_pretrained done")
+        return model
+
+    transformers.AutoModelForCausalLM.from_pretrained = classmethod(from_pretrained)
+    train = sft.SFTTrainerWrapper.train
+
+    def train_(self, *args, **kwargs):
+        mark("trainer built, train() begins")
+        try:
+            return train(self, *args, **kwargs)
+        finally:
+            mark("train() returned (adapter saved)")
+
+    sft.SFTTrainerWrapper.train = train_
+    step = trl.SFTTrainer.training_step
+    count = [0]
+
+    def training_step(self, *args, **kwargs):
+        count[0] += 1
+        if count[0] in (1, 2, 3, 64):
+            torch.cuda.synchronize()
+            mark(f"step {count[0]} begins")
+        out = step(self, *args, **kwargs)
+        if count[0] in (1, 2, 3, 64):
+            torch.cuda.synchronize()
+            mark(f"step {count[0]} ends")
+        return out
+
+    trl.SFTTrainer.training_step = training_step
+    def report():
+        mark("process exits")
+        try:
+            from .warmup import _variants
+            seen = {}
+            for kernel, _, _ in _variants()[0]:
+                if id(kernel) in seen:
+                    continue
+                seen[id(kernel)] = True
+                counts = [len(cache[0]) for cache in kernel.device_caches.values()]
+                print(f"[timelog] compiled variants {kernel.__name__}: {counts}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[timelog] variant report failed: {exc!r}", flush=True)
+
+    import atexit
+    atexit.register(report)
+
+
 def _patch_memlog():
     """Development only (SOUP_KERNELS_MEMLOG=1): print where the GPU memory peak happens."""
     if _os.environ.get("SOUP_KERNELS_MEMLOG") != "1":
@@ -402,6 +488,7 @@ def _patch_memlog():
 
 
 def apply_all():
+    _patch_timelog()
     _patch_memlog()
     _patch_kbit_prep()
     _patch_causal_lm()

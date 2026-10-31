@@ -27,8 +27,9 @@ def _knob(name, default):
 
 MLP_RECOMPUTE = _knob("MLP_RECOMPUTE", False)     # keep x, recompute gate/up in the backward
 ATTN_RECOMPUTE = _knob("ATTN_RECOMPUTE", False)
-HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "256"))  # rows per lm_head chunk
+HEAD_CHUNK = int(_os.environ.get("SOUP_KERNELS_HEAD_CHUNK", "128"))  # rows per lm_head chunk
    # keep x and LoRA-A out, recompute q/k/v + SDPA
+WARMUP = _knob("WARMUP", True)       # compile our kernels in a thread while the model loads
 USE_STACK = _knob("USE_STACK", True)    # our own pad-free decoder stack (attention + MLP + norms)
 ALLOW_CPU = False  # only for our CPU tests under TRITON_INTERPRET=1
 
@@ -408,3 +409,6 @@ def apply_all():
     _patch_mlp()
     _patch_trl_compute_loss()
     _patch_soup_setup()
+    if WARMUP:
+        from .warmup import start
+        start()

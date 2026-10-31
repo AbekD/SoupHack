@@ -1,25 +1,23 @@
 """Qwen2 self-attention block on packed (pad-free) tokens: QKV projection with LoRA on q and v,
-RoPE, causal attention, o_proj. Forward and backward written out by hand, so autograd keeps only
-what the backward really needs.
-
-Per token, the base block keeps (fp16 unless noted): three copies of the projection input
-(bitsandbytes saves its input even for frozen weights), the LoRA dropout masks and dropped
-inputs, q / k pre-RoPE in fp32 plus the RoPE intermediates, the expanded k / v, the attention
-output and o_proj's input. Here:
+RoPE, causal attention, o_proj. Forward and backward written out by hand, so only what the
+backward really needs is kept, and kept without padding.
 
   * q, k, v come from one tensor-core GEMM over the three NF4 weights unpacked side by side
-    (our NF4 kernel), with the fp16 bias in the GEMM epilogue as bitsandbytes' F.linear does;
+    (our NF4 kernel), with the fp16 bias in the GEMM as bitsandbytes' F.linear does;
   * LoRA dropout uses the very masks the base run draws (same CUDA RNG calls), applied to the
     packed rows in Triton; the backward replays the RNG state instead of storing masks;
-  * one Triton kernel adds the LoRA outputs, applies RoPE in fp32 (angles from the position and
-    inv_freq, as Qwen2RotaryEmbedding computes them) and scatters q / k / v into the padded
-    [B, H, T, 128] layout attention wants; a second one is its exact transpose for the backward;
-  * attention is PyTorch's memory-efficient SDPA kernel (is_causal, right padding makes pad keys
-    invisible to real queries), recorded in a small local graph;
+  * one Triton kernel adds the LoRA outputs and applies RoPE in fp32 (angles from the position
+    and inv_freq, as Qwen2RotaryEmbedding computes them), in place over the packed q / k / v;
+  * attention is PyTorch's memory-efficient attention kernel (aten op), causal, on the per-row
+    padded [B, T, H, 128] layout; right padding makes pad keys invisible to real queries;
+  * what the attention backward needs (q, k, v, out) is kept PACKED - real tokens only, k / v
+    with 2 kv heads instead of the 12 repeated ones - plus its logsumexp. Rows at pad
+    positions never influence a real token's gradient (their output gradient is zero and real
+    queries never see pad keys), so the backward rebuilds the padded tensors with zeros there;
   * o_proj's weight is frozen: its input is not kept.
 
-Kept per token: the block input (shared with the norm before it), the [N, 32] LoRA A output and
-SDPA's own q / k / v / out / logsumexp.
+Kept per real token and layer: the block input (shared with the norm before it), the [32] LoRA A
+output, the rotated q / k / v (2048 fp16) and the attention output (1536 fp16).
 """
 
 from __future__ import annotations
@@ -108,127 +106,66 @@ def masked_rows_bwd(base, gq, gv, mq, mv, pack, out_dtype):
     return out
 
 
-# ----------------------------------------------------------------------------- RoPE + (un)pack
+# ----------------------------------------------------------------------------- RoPE
 
-@triton.jit(do_not_specialize=["T"])
-def rope_pack_kernel(
-    qkv_ptr, lq_ptr, lv_ptr,          # [N, QD + 2 KD] fp16, [N, QD] fp16, [N, KD] fp16
-    pos_ptr, dst_ptr, inv_freq_ptr,   # [N] int32 position, [N] int64 b*T + t, [HALF] fp32
-    q_ptr, k_ptr, v_ptr,              # [B, HQ, T, HD], [B, HK, T, HD] x2, fp16
-    T, lora_scale,
-    HQ: tl.constexpr, HK: tl.constexpr, HD: tl.constexpr, HAS_LORA: tl.constexpr,
+@triton.jit
+def rope_lora_kernel(
+    qkv_ptr, lq_ptr, lv_ptr,          # [N, QD + 2 KD] fp16 (in place), [N, QD], [N, KD] fp16
+    pos_ptr, inv_freq_ptr,            # [N] int32 positions, [HD // 2] fp32
+    lora_scale,
+    HQ: tl.constexpr, HK: tl.constexpr, HD: tl.constexpr,
 ):
+    # q += scale * lq, v += scale * lv (fp32, one rounding), then RoPE on q and k, in place
     tok = tl.program_id(0).to(tl.int64)
     HALF: tl.constexpr = HD // 2
     QD: tl.constexpr = HQ * HD
     KD: tl.constexpr = HK * HD
     j = tl.arange(0, HALF)
-    pos = tl.load(pos_ptr + tok).to(tl.float32)
-    ang = pos * tl.load(inv_freq_ptr + j)
+    ang = tl.load(pos_ptr + tok).to(tl.float32) * tl.load(inv_freq_ptr + j)
     c = tl.cos(ang)
     s = tl.sin(ang)
-    dst = tl.load(dst_ptr + tok)
-    b = dst // T
-    t = dst % T
     row = qkv_ptr + tok * (QD + 2 * KD)
     for h in tl.static_range(HQ):
-        x1 = tl.load(row + h * HD + j).to(tl.float32)
-        x2 = tl.load(row + h * HD + HALF + j).to(tl.float32)
-        if HAS_LORA:
-            x1 += tl.load(lq_ptr + tok * QD + h * HD + j).to(tl.float32) * lora_scale
-            x2 += tl.load(lq_ptr + tok * QD + h * HD + HALF + j).to(tl.float32) * lora_scale
-        out = q_ptr + ((b * HQ + h) * T + t) * HD
-        tl.store(out + j, (x1 * c - x2 * s).to(tl.float16))
-        tl.store(out + HALF + j, (x2 * c + x1 * s).to(tl.float16))
+        x1 = tl.load(row + h * HD + j).to(tl.float32) + \
+            tl.load(lq_ptr + tok * QD + h * HD + j).to(tl.float32) * lora_scale
+        x2 = tl.load(row + h * HD + HALF + j).to(tl.float32) + \
+            tl.load(lq_ptr + tok * QD + h * HD + HALF + j).to(tl.float32) * lora_scale
+        tl.store(row + h * HD + j, (x1 * c - x2 * s).to(tl.float16))
+        tl.store(row + h * HD + HALF + j, (x2 * c + x1 * s).to(tl.float16))
     for h in tl.static_range(HK):
         x1 = tl.load(row + QD + h * HD + j).to(tl.float32)
         x2 = tl.load(row + QD + h * HD + HALF + j).to(tl.float32)
-        out = k_ptr + ((b * HK + h) * T + t) * HD
-        tl.store(out + j, (x1 * c - x2 * s).to(tl.float16))
-        tl.store(out + HALF + j, (x2 * c + x1 * s).to(tl.float16))
-        v1 = tl.load(row + QD + KD + h * HD + j).to(tl.float32)
-        v2 = tl.load(row + QD + KD + h * HD + HALF + j).to(tl.float32)
-        if HAS_LORA:
-            v1 += tl.load(lv_ptr + tok * KD + h * HD + j).to(tl.float32) * lora_scale
-            v2 += tl.load(lv_ptr + tok * KD + h * HD + HALF + j).to(tl.float32) * lora_scale
-        out = v_ptr + ((b * HK + h) * T + t) * HD
-        tl.store(out + j, v1.to(tl.float16))
-        tl.store(out + HALF + j, v2.to(tl.float16))
+        tl.store(row + QD + h * HD + j, (x1 * c - x2 * s).to(tl.float16))
+        tl.store(row + QD + h * HD + HALF + j, (x2 * c + x1 * s).to(tl.float16))
+        v1 = tl.load(row + QD + KD + h * HD + j).to(tl.float32) + \
+            tl.load(lv_ptr + tok * KD + h * HD + j).to(tl.float32) * lora_scale
+        v2 = tl.load(row + QD + KD + h * HD + HALF + j).to(tl.float32) + \
+            tl.load(lv_ptr + tok * KD + h * HD + HALF + j).to(tl.float32) * lora_scale
+        tl.store(row + QD + KD + h * HD + j, v1.to(tl.float16))
+        tl.store(row + QD + KD + h * HD + HALF + j, v2.to(tl.float16))
 
 
-@triton.jit(do_not_specialize=["T"])
-def rope_unpack_bwd_kernel(
-    dq_ptr, dk_ptr, dv_ptr,           # [B, HQ, T, HD], [B, HQ, T, HD] (per q head), [B, HQ, T, HD]
-    pos_ptr, dst_ptr, inv_freq_ptr,
-    dqkv_ptr,                         # [N, QD + 2 KD] fp16: gradient of the pre-RoPE q / k / v
-    T,
+@triton.jit
+def rope_inverse_kernel(
+    g_ptr,                            # [N, QD + 2 KD] fp16, in place: gradients of rotated q / k
+    pos_ptr, inv_freq_ptr,
     HQ: tl.constexpr, HK: tl.constexpr, HD: tl.constexpr,
 ):
-    # transpose of rope_pack: rotate back by -angle; k / v gradients summed over the q heads that
-    # share each kv head (GQA)
+    # transpose of the rotation (rotate by -angle) on the q and k parts; v is left as it is
     tok = tl.program_id(0).to(tl.int64)
     HALF: tl.constexpr = HD // 2
     QD: tl.constexpr = HQ * HD
     KD: tl.constexpr = HK * HD
-    GROUP: tl.constexpr = HQ // HK
     j = tl.arange(0, HALF)
-    pos = tl.load(pos_ptr + tok).to(tl.float32)
-    ang = pos * tl.load(inv_freq_ptr + j)
+    ang = tl.load(pos_ptr + tok).to(tl.float32) * tl.load(inv_freq_ptr + j)
     c = tl.cos(ang)
     s = tl.sin(ang)
-    dst = tl.load(dst_ptr + tok)
-    b = dst // T
-    t = dst % T
-    row = dqkv_ptr + tok * (QD + 2 * KD)
-    for h in tl.static_range(HQ):
-        src = dq_ptr + ((b * HQ + h) * T + t) * HD
-        g1 = tl.load(src + j).to(tl.float32)
-        g2 = tl.load(src + HALF + j).to(tl.float32)
+    row = g_ptr + tok * (QD + 2 * KD)
+    for h in tl.static_range(HQ + HK):
+        g1 = tl.load(row + h * HD + j).to(tl.float32)
+        g2 = tl.load(row + h * HD + HALF + j).to(tl.float32)
         tl.store(row + h * HD + j, (g1 * c + g2 * s).to(tl.float16))
         tl.store(row + h * HD + HALF + j, (g2 * c - g1 * s).to(tl.float16))
-    for hk in tl.static_range(HK):
-        k1 = tl.zeros([HALF], tl.float32)
-        k2 = tl.zeros([HALF], tl.float32)
-        w1 = tl.zeros([HALF], tl.float32)
-        w2 = tl.zeros([HALF], tl.float32)
-        for r in tl.static_range(GROUP):
-            h = hk * GROUP + r
-            srck = dk_ptr + ((b * HQ + h) * T + t) * HD
-            k1 += tl.load(srck + j).to(tl.float32)
-            k2 += tl.load(srck + HALF + j).to(tl.float32)
-            srcv = dv_ptr + ((b * HQ + h) * T + t) * HD
-            w1 += tl.load(srcv + j).to(tl.float32)
-            w2 += tl.load(srcv + HALF + j).to(tl.float32)
-        tl.store(row + QD + hk * HD + j, (k1 * c + k2 * s).to(tl.float16))
-        tl.store(row + QD + hk * HD + HALF + j, (k2 * c - k1 * s).to(tl.float16))
-        tl.store(row + QD + KD + hk * HD + j, w1.to(tl.float16))
-        tl.store(row + QD + KD + hk * HD + HALF + j, w2.to(tl.float16))
-
-
-@triton.jit(do_not_specialize=["T"])
-def gather_rows_kernel(src_ptr, dst_idx_ptr, out_ptr, T, H: tl.constexpr, HD: tl.constexpr):
-    # out[tok, h*HD + d] = src[b, h, t, d]  (attention output back to packed [N, H*HD])
-    tok = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    d = tl.arange(0, HD)
-    dst = tl.load(dst_idx_ptr + tok)
-    b = dst // T
-    t = dst % T
-    x = tl.load(src_ptr + ((b * H + h) * T + t) * HD + d)
-    tl.store(out_ptr + tok * (H * HD) + h * HD + d, x)
-
-
-@triton.jit(do_not_specialize=["T"])
-def scatter_rows_kernel(src_ptr, dst_idx_ptr, out_ptr, T, H: tl.constexpr, HD: tl.constexpr):
-    # out[b, h, t, d] = src[tok, h*HD + d]  (its transpose; pads stay zero)
-    tok = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    d = tl.arange(0, HD)
-    dst = tl.load(dst_idx_ptr + tok)
-    b = dst // T
-    t = dst % T
-    x = tl.load(src_ptr + tok * (H * HD) + h * HD + d)
-    tl.store(out_ptr + ((b * H + h) * T + t) * HD + d, x)
 
 
 # ----------------------------------------------------------------------------- the block
@@ -259,35 +196,88 @@ def dense_qkv(q_w, k_w, v_w):
     return buf
 
 
-def _attention_core(x, a, b_q, b_v, w_qkv, spec, pack):
-    """qkv GEMM (+bias), LoRA B, RoPE + scatter to [B, H, T, HD], SDPA. Returns the small autograd
-    graph (q, k_rep, v_rep, o_pad) that the backward differentiates."""
-    N = x.shape[0]
-    HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
+def _padded(rows, pack, heads, head_dim, repeat=1):
+    """Packed rows [N, heads*hd] -> [B, heads*repeat, T, hd] as a transposed view of a
+    [B, T, H, hd] buffer, zeros at pad positions (each kv head repeated `repeat` times)."""
     B, T = pack.B, pack.T
-    dev = x.device
+    buf = rows.new_zeros(B * T, heads * head_dim)
+    buf.index_copy_(0, pack.dst, rows)
+    t = buf.view(B, T, heads, head_dim)
+    if repeat > 1:
+        t = t.unsqueeze(3).expand(B, T, heads, repeat, head_dim).reshape(B, T, heads * repeat,
+                                                                          head_dim)
+    return t.transpose(1, 2)
+
+
+def _packed(t, pack, group=1):
+    """[B, H, T, hd] (any layout) -> packed rows [N, H*hd / group], summing `group` adjacent
+    heads (the GQA reduction of k / v gradients)."""
+    B, H, T, HD = t.shape
+    rows = t.transpose(1, 2).reshape(B * T, H, HD)
+    if group > 1:
+        rows = rows.view(B * T, H // group, group, HD).sum(2, dtype=torch.float32).to(t.dtype)
+    return rows.reshape(B * T, -1).index_select(0, pack.dst)
+
+
+def _eff_attention_fwd(q, k, v, scale):
+    """PyTorch's memory-efficient attention (causal), with its logsumexp. Off CUDA (our CPU tests
+    under the Triton interpreter) a plain fp32 implementation of the same op."""
+    if q.is_cuda:
+        return torch.ops.aten._scaled_dot_product_efficient_attention(
+            q, k, v, None, True, 0.0, True, scale=scale)
+    T = q.shape[2]
+    s = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
+    s = s.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))
+    lse = torch.logsumexp(s, dim=-1)
+    out = torch.matmul(torch.exp(s - lse[..., None]), v.float()).to(q.dtype)
+    return out, lse, torch.zeros(()), torch.zeros(())
+
+
+def _eff_attention_bwd(do, q, k, v, out, lse, seed, offset, scale):
+    if q.is_cuda:
+        dq, dk, dv, _ = torch.ops.aten._scaled_dot_product_efficient_attention_backward(
+            do, q, k, v, None, out, lse, seed, offset, 0.0, [True, True, True, False], True,
+            scale=scale)
+        return dq, dk, dv
+    T = q.shape[2]
+    qf, kf, vf, dof = q.float(), k.float(), v.float(), do.float()
+    s = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    s = s.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))
+    prob = torch.exp(s - lse[..., None])
+    dv = torch.matmul(prob.transpose(-1, -2), dof)
+    dp = torch.matmul(dof, vf.transpose(-1, -2))
+    ds = prob * (dp - (dof * out.float()).sum(-1, keepdim=True)) * scale
+    dq = torch.matmul(ds, kf)
+    dk = torch.matmul(ds.transpose(-1, -2), qf)
+    return dq.to(q.dtype), dk.to(q.dtype), dv.to(q.dtype)
+
+
+def _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack):
+    """[N, QD + 2 KD] fp16: q / k / v projections + bias + LoRA, RoPE on q and k."""
+    N = x.shape[0]
     r = a.shape[1] // 2
     qkv = torch.addmm(spec["bias16"], x, w_qkv.t()) if spec["bias16"] is not None \
         else torch.mm(x, w_qkv.t())
     lq = torch.mm(a[:, :r], b_q.to(torch.float16).t())   # [N, QD]
     lv = torch.mm(a[:, r:], b_v.to(torch.float16).t())   # [N, KD]
-    q = torch.zeros(B, HQ, T, HD, device=dev, dtype=torch.float16)
-    k = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
-    v = torch.zeros(B, HK, T, HD, device=dev, dtype=torch.float16)
     if N:
-        rope_pack_kernel[(N,)](qkv, lq, lv, pack.pos, pack.dst, spec["inv_freq"],
-                               q, k, v, T, spec["scaling"], HQ=HQ, HK=HK, HD=HD, HAS_LORA=True,
-                               num_warps=2)
-    del qkv, lq, lv
-    group = HQ // HK
-    q.requires_grad_(True)
-    k_rep = k.repeat_interleave(group, dim=1).requires_grad_(True)
-    v_rep = v.repeat_interleave(group, dim=1).requires_grad_(True)
-    del k, v
-    with torch.enable_grad():
-        o_pad = torch.nn.functional.scaled_dot_product_attention(
-            q, k_rep, v_rep, is_causal=True, scale=spec["softmax_scale"])
-    return q, k_rep, v_rep, o_pad
+        rope_lora_kernel[(N,)](qkv, lq, lv, pack.pos, spec["inv_freq"], spec["scaling"],
+                               HQ=spec["hq"], HK=spec["hk"], HD=spec["hd"], num_warps=2)
+    return qkv
+
+
+def _attention_fwd(qkv, spec, pack):
+    """Causal attention of the packed rotated q / k / v. Returns (packed out [N, QD], lse, seed,
+    offset)."""
+    HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
+    QD, KD = HQ * HD, HK * HD
+    G = HQ // HK
+    q = _padded(qkv[:, :QD], pack, HQ, HD)
+    k = _padded(qkv[:, QD:QD + KD], pack, HK, HD, G)
+    v = _padded(qkv[:, QD + KD:], pack, HK, HD, G)
+    out, lse, seed, offset = _eff_attention_fwd(q, k, v, spec["softmax_scale"])
+    del q, k, v
+    return _packed(out, pack), lse, seed, offset
 
 
 class AttentionBlock(torch.autograd.Function):
@@ -296,9 +286,6 @@ class AttentionBlock(torch.autograd.Function):
         # x [N, D] fp16 packed tokens. a_* [r, D], b_* [out, r] fp32 LoRA weights (trainable).
         # spec: dict with weights / sizes / dropout / recompute; pack: PackInfo
         N, D = x.shape
-        HQ, HD = spec["hq"], spec["hd"]
-        QD = HQ * HD
-        T = pack.T
         dev = x.device
         p = spec["p"]
         recompute = spec.get("recompute", False)
@@ -317,56 +304,57 @@ class AttentionBlock(torch.autograd.Function):
             torch.mm(xv, a_v.to(torch.float16).t(), out=a[:, r:])
             del xq, xv
             w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
-            graph = _attention_core(x, a, b_q, b_v, w_qkv, spec, pack)
+            qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
             del w_qkv
-            o_pad = graph[3]
-            o = torch.empty(N, QD, device=dev, dtype=torch.float16)
-            if N:
-                gather_rows_kernel[(N, HQ)](o_pad.detach().contiguous(), pack.dst, o, T, H=HQ,
-                                            HD=HD, num_warps=1)
+            o, lse, seed, offset = _attention_fwd(qkv, spec, pack)
             w_o = unpack_nf4(spec["o_w"])
             out = torch.mm(o, w_o.t())
-            del w_o, o
-        ctx.spec, ctx.pack, ctx.rng = spec, pack, rng
-        ctx.graph = None if recompute else graph
-        del graph, o_pad
-        ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v)
+            del w_o
+        ctx.spec, ctx.pack, ctx.rng, ctx.recompute = spec, pack, rng, recompute
+        if recompute:
+            del qkv, o, lse, seed, offset
+            ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v)
+        else:
+            ctx.save_for_backward(x, a, a_q, b_q, a_v, b_v, qkv, o, lse, seed, offset)
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        x, a, a_q, b_q, a_v, b_v = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        x, a, a_q, b_q, a_v, b_v = saved[:6]
         spec, pack = ctx.spec, ctx.pack
         N, D = x.shape
         HQ, HK, HD = spec["hq"], spec["hk"], spec["hd"]
         QD, KD = HQ * HD, HK * HD
-        B, T = pack.B, pack.T
+        G = HQ // HK
         dev = x.device
         p, scale = spec["p"], spec["scaling"]
         r = a_q.shape[0]
         dout16 = dout.to(torch.float16).contiguous()
 
         w_qkv = dense_qkv(spec["q_w"], spec["k_w"], spec["v_w"])
-        if ctx.graph is None:      # recompute the attention half of the forward
-            q, k_rep, v_rep, o_pad = _attention_core(x, a, b_q, b_v, w_qkv, spec, pack)
+        if ctx.recompute:          # recompute the attention half of the forward
+            qkv = _qkv_rotated(x, a, b_q, b_v, w_qkv, spec, pack)
+            o, lse, seed, offset = _attention_fwd(qkv, spec, pack)
         else:
-            q, k_rep, v_rep, o_pad = ctx.graph
-            ctx.graph = None
+            qkv, o, lse, seed, offset = saved[6:]
         w_o = unpack_nf4(spec["o_w"])
         do = torch.mm(dout16, w_o)                              # [N, QD]
         del w_o
-        do_pad = torch.zeros(B, HQ, T, HD, device=dev, dtype=torch.float16)
-        if N:
-            scatter_rows_kernel[(N, HQ)](do, pack.dst, do_pad, T, H=HQ, HD=HD, num_warps=1)
-        del do
-        dq, dk, dv = torch.autograd.grad(o_pad, (q, k_rep, v_rep), do_pad)
-        del do_pad, o_pad, q, k_rep, v_rep
-        dq, dk, dv = dq.contiguous(), dk.contiguous(), dv.contiguous()
-        dqkv = torch.empty(N, QD + 2 * KD, device=dev, dtype=torch.float16)
-        if N:
-            rope_unpack_bwd_kernel[(N,)](dq, dk, dv, pack.pos, pack.dst, spec["inv_freq"], dqkv,
-                                         T, HQ=HQ, HK=HK, HD=HD, num_warps=2)
+        q = _padded(qkv[:, :QD], pack, HQ, HD)
+        k = _padded(qkv[:, QD:QD + KD], pack, HK, HD, G)
+        v = _padded(qkv[:, QD + KD:], pack, HK, HD, G)
+        out_p = _padded(o, pack, HQ, HD)
+        do_p = _padded(do, pack, HQ, HD)
+        del do, o
+        dq, dk, dv = _eff_attention_bwd(do_p, q, k, v, out_p, lse, seed, offset,
+                                        spec["softmax_scale"])
+        del q, k, v, out_p, do_p
+        dqkv = torch.cat([_packed(dq, pack), _packed(dk, pack, G), _packed(dv, pack, G)], dim=1)
         del dq, dk, dv
+        if N:
+            rope_inverse_kernel[(N,)](dqkv, pack.pos, spec["inv_freq"], HQ=HQ, HK=HK, HD=HD,
+                                      num_warps=2)
         dq_pre = dqkv[:, :QD]
         dv_pre = dqkv[:, QD + KD:]
         # LoRA: lq = scale * a_q @ b_q^T  (a_q = a[:, :r]), same for v

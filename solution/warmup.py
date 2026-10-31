@@ -74,7 +74,10 @@ def _variants(mlp_mode="int8"):
     ], one
 
 
-THREADS = 2   # Kaggle gives 4 CPU cores; compilation is mostly outside the GIL
+import os as _os
+
+# Kaggle gives 4 CPU cores; compilation is mostly outside the GIL (dev knob for A/B runs)
+THREADS = max(1, int(_os.environ.get("SOUP_KERNELS_WARMUP_THREADS", "2")))
 
 
 def _compile(variants, grid):

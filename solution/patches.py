@@ -395,6 +395,9 @@ def _patch_timelog():
         print(f"[timelog] {_since_start():7.2f}s  {what}", flush=True)
 
     mark("apply()")
+    import atexit as _atexit
+    # registered before Soup's / TRL's own exit handlers, so it runs after them (LIFO)
+    _atexit.register(lambda: mark("late atexit (after the other exit handlers)"))
     setup = sft.SFTTrainerWrapper._setup_transformers
 
     def _setup_transformers(self, *args, **kwargs):

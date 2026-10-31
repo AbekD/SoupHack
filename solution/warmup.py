@@ -5,8 +5,9 @@ first launch stalled the first training step by ~7 s on the T4 (step 1: 7.9 s vs
 base). Compilation is CPU work and mostly runs outside the GIL, and loading + quantising the
 checkpoint takes ~15 s, so `apply()` starts one thread that compiles every kernel variant the
 training step will launch (Triton's own `JITFunction.warmup`: compile only, nothing runs on the
-GPU), with the argument types and the integer values that decide Triton's specialisation. The
-first step then finds them in Triton's in-process cache. The compile time still counts in the
+GPU), with the argument types and the integer values that decide Triton's specialisation, and
+also builds each kernel's C launcher (Triton compiles it with gcc at first launch, ~0.2-0.5 s
+each on Kaggle) and loads its binary. The first step then finds them all ready. The compile time still counts in the
 measured wall time; it just overlaps with model loading. If a variant was not warmed (another
 model shape), it compiles at first launch as before.
 
@@ -83,7 +84,14 @@ def _compile(variants, grid):
         return
     for kernel, args, kwargs in variants:
         try:
-            kernel.warmup(*args, grid=grid, **kwargs)
+            compiled = kernel.warmup(*args, grid=grid, **kwargs)
+            if hasattr(compiled, "result"):
+                compiled = compiled.result()
+            # Triton builds each kernel's C launcher (a gcc call) and loads its binary only at the
+            # first launch; do that here too, so the first training step does neither
+            init = getattr(compiled, "_init_handles", None)
+            if callable(init):
+                init()
         except Exception:  # noqa: BLE001 - warming up is an optimisation, never a failure
             pass
 
@@ -151,6 +159,10 @@ def _run():
         pass
     for thread in threads:
         thread.join()
+    import os
+    if os.environ.get("SOUP_KERNELS_TIMELOG") == "1":
+        from .patches import _since_start
+        print(f"[timelog] {_since_start():7.2f}s  warmup thread done", flush=True)
 
 
 def start():
